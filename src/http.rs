@@ -1,16 +1,25 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use eyre::{Report, Result, bail, ensure};
+use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{ClientBuilder, IntoUrl, Method, Response};
 use std::sync::LazyLock as Lazy;
+use tokio::sync::OnceCell;
+use tokio_retry::Retry;
+use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use url::Url;
 
 use crate::cli::version;
 use crate::config::Settings;
 use crate::file::display_path;
+use crate::netrc;
 use crate::ui::progress_report::SingleReport;
 use crate::ui::time::format_duration;
 use crate::{env, file};
@@ -29,6 +38,14 @@ pub static HTTP_FETCH: Lazy<Client> = Lazy::new(|| {
     )
     .unwrap()
 });
+
+/// In-memory cache for HTTP text responses, useful for requests that are repeated
+/// during a single operation (e.g., fetching SHASUMS256.txt for multiple platforms).
+/// Each URL gets its own OnceCell to ensure concurrent requests for the same URL
+/// wait for the first fetch to complete rather than all fetching simultaneously.
+type CachedResult = Arc<OnceCell<Result<String, String>>>;
+static HTTP_CACHE: Lazy<Mutex<HashMap<String, CachedResult>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug)]
 pub struct Client {
@@ -83,7 +100,7 @@ impl Client {
         url: U,
         headers: &HeaderMap,
     ) -> Result<Response> {
-        ensure!(!*env::OFFLINE, "offline mode is enabled");
+        ensure!(!Settings::get().offline(), "offline mode is enabled");
         let url = url.into_url().unwrap();
         let resp = self
             .send_with_https_fallback(Method::GET, url, headers, "GET")
@@ -103,7 +120,7 @@ impl Client {
         url: U,
         headers: &HeaderMap,
     ) -> Result<Response> {
-        ensure!(!*env::OFFLINE, "offline mode is enabled");
+        ensure!(!Settings::get().offline(), "offline mode is enabled");
         let url = url.into_url().unwrap();
         let resp = self
             .send_with_https_fallback(Method::HEAD, url, headers, "HEAD")
@@ -113,18 +130,62 @@ impl Client {
     }
 
     pub async fn get_text<U: IntoUrl>(&self, url: U) -> Result<String> {
+        self.get_text_with_headers(url, &HeaderMap::new()).await
+    }
+
+    pub async fn get_text_with_headers<U: IntoUrl>(
+        &self,
+        url: U,
+        extra_headers: &HeaderMap,
+    ) -> Result<String> {
         let mut url = url.into_url().unwrap();
-        let resp = self.get_async(url.clone()).await?;
+        // Merge GitHub headers with any extra headers provided
+        let mut headers = github_headers(&url);
+        headers.extend(extra_headers.clone());
+        let resp = self.get_async_with_headers(url.clone(), &headers).await?;
         let text = resp.text().await?;
         if text.starts_with("<!DOCTYPE html>") {
             if url.scheme() == "http" {
                 // try with https since http may be blocked
                 url.set_scheme("https").unwrap();
-                return Box::pin(self.get_text(url)).await;
+                return Box::pin(self.get_text_with_headers(url, extra_headers)).await;
             }
             bail!("Got HTML instead of text from {}", url);
         }
         Ok(text)
+    }
+
+    /// Like get_text but caches results in memory for the duration of the process.
+    /// Useful when the same URL will be requested multiple times (e.g., SHASUMS256.txt
+    /// when locking multiple platforms). Concurrent requests for the same URL will
+    /// wait for the first fetch to complete.
+    pub async fn get_text_cached<U: IntoUrl>(&self, url: U) -> Result<String> {
+        let url = url.into_url().unwrap();
+        let key = url.to_string();
+
+        // Get or create the OnceCell for this URL
+        let cell = {
+            let mut cache = HTTP_CACHE.lock().unwrap();
+            cache.entry(key).or_default().clone()
+        };
+
+        // Initialize the cell if needed - concurrent callers will wait
+        let result = cell
+            .get_or_init(|| {
+                let url = url.clone();
+                async move {
+                    match self.get_text(url).await {
+                        Ok(text) => Ok(text),
+                        Err(err) => Err(err.to_string()),
+                    }
+                }
+            })
+            .await;
+
+        match result {
+            Ok(text) => Ok(text.clone()),
+            Err(err) => bail!("{}", err),
+        }
     }
 
     pub async fn get_html<U: IntoUrl>(&self, url: U) -> Result<String> {
@@ -170,6 +231,18 @@ impl Client {
         self.json_headers(url).await.map(|(json, _)| json)
     }
 
+    /// Like json but caches raw JSON text in memory for the duration of the process.
+    /// Useful when the same URL will be requested multiple times (e.g., zig index.json
+    /// when locking multiple platforms). Concurrent requests for the same URL will
+    /// wait for the first fetch to complete.
+    pub async fn json_cached<T, U: IntoUrl>(&self, url: U) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let text = self.get_text_cached(url).await?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
     pub async fn json_with_headers<T, U: IntoUrl>(&self, url: U, headers: &HeaderMap) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
@@ -179,11 +252,44 @@ impl Client {
             .map(|(json, _)| json)
     }
 
+    /// POST JSON data to a URL. Returns Ok(true) on success, Ok(false) on non-success status.
+    /// Errors only on network/connection failures.
+    #[allow(dead_code)]
+    pub async fn post_json<U: IntoUrl, T: serde::Serialize>(
+        &self,
+        url: U,
+        body: &T,
+    ) -> Result<bool> {
+        self.post_json_with_headers(url, body, &HeaderMap::new())
+            .await
+    }
+
+    /// POST JSON data to a URL with custom headers.
+    pub async fn post_json_with_headers<U: IntoUrl, T: serde::Serialize>(
+        &self,
+        url: U,
+        body: &T,
+        headers: &HeaderMap,
+    ) -> Result<bool> {
+        ensure!(!Settings::get().offline(), "offline mode is enabled");
+        let url = url.into_url()?;
+        debug!("POST {}", &url);
+        let resp = self
+            .reqwest
+            .post(url)
+            .header("Content-Type", "application/json")
+            .headers(headers.clone())
+            .json(body)
+            .send()
+            .await?;
+        Ok(resp.status().is_success())
+    }
+
     pub async fn download_file<U: IntoUrl>(
         &self,
         url: U,
         path: &Path,
-        pr: Option<&Box<dyn SingleReport>>,
+        pr: Option<&dyn SingleReport>,
     ) -> Result<()> {
         let url = url.into_url()?;
         let headers = github_headers(&url);
@@ -196,22 +302,26 @@ impl Client {
         url: U,
         path: &Path,
         headers: &HeaderMap,
-        pr: Option<&Box<dyn SingleReport>>,
+        pr: Option<&dyn SingleReport>,
     ) -> Result<()> {
         let url = url.into_url()?;
         debug!("GET Downloading {} to {}", &url, display_path(path));
-
-        let mut resp = self.get_async_with_headers(url, headers).await?;
-        if let Some(length) = resp.content_length() {
-            if let Some(pr) = pr {
-                pr.set_length(length);
-            }
+        let mut resp = self.get_async_with_headers(url.clone(), headers).await?;
+        if let Some(length) = resp.content_length()
+            && let Some(pr) = pr
+        {
+            // Reset progress on each attempt
+            pr.set_length(length);
+            pr.set_position(0);
         }
 
         let parent = path.parent().unwrap();
         file::create_dir_all(parent)?;
         let mut file = tempfile::NamedTempFile::with_prefix_in(path, parent)?;
         while let Some(chunk) = resp.chunk().await? {
+            if crate::ui::ctrlc::is_cancelled() {
+                bail!("download cancelled by user");
+            }
             file.write_all(&chunk)?;
             if let Some(pr) = pr {
                 pr.inc(chunk.len() as u64);
@@ -224,33 +334,51 @@ impl Client {
     async fn send_with_https_fallback(
         &self,
         method: Method,
-        mut url: Url,
+        url: Url,
         headers: &HeaderMap,
         verb_label: &str,
     ) -> Result<Response> {
-        match self
-            .send_once(method.clone(), url.clone(), headers, verb_label)
-            .await
-        {
-            Ok(resp) => Ok(resp),
-            Err(_) if url.scheme() == "http" => {
-                url.set_scheme("https").unwrap();
-                self.send_once(method, url, headers, verb_label).await
-            }
-            Err(err) => Err(err),
-        }
+        Retry::spawn(
+            default_backoff_strategy(Settings::get().http_retries),
+            || {
+                let method = method.clone();
+                let url = url.clone();
+                let headers = headers.clone();
+                async move {
+                    match self
+                        .send_once(method.clone(), url.clone(), &headers, verb_label)
+                        .await
+                    {
+                        Ok(resp) => Ok(resp),
+                        Err(_err) if url.scheme() == "http" => {
+                            let mut url = url;
+                            url.set_scheme("https").unwrap();
+                            self.send_once(method, url, &headers, verb_label).await
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+            },
+        )
+        .await
     }
 
     async fn send_once(
         &self,
         method: Method,
-        url: Url,
+        mut url: Url,
         headers: &HeaderMap,
         verb_label: &str,
     ) -> Result<Response> {
+        apply_url_replacements(&mut url);
         debug!("{} {}", verb_label, &url);
+
+        // Apply netrc credentials after URL replacement
+        let mut final_headers = headers.clone();
+        final_headers.extend(netrc_headers(&url));
+
         let mut req = self.reqwest.request(method, url.clone());
-        req = req.headers(headers.clone());
+        req = req.headers(final_headers);
         let resp = match req.send().await {
             Ok(resp) => resp,
             Err(err) => {
@@ -307,19 +435,87 @@ pub fn error_code(e: &Report) -> Option<u16> {
 
 fn github_headers(url: &Url) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    if url.host_str() == Some("api.github.com") {
-        if let Some(token) = &*env::GITHUB_TOKEN {
-            headers.insert(
-                "authorization",
-                HeaderValue::from_str(format!("token {token}").as_str()).unwrap(),
-            );
-            headers.insert(
-                "x-github-api-version",
-                HeaderValue::from_static("2022-11-28"),
-            );
+    if url.host_str() == Some("api.github.com")
+        && let Some(token) = &*env::GITHUB_TOKEN
+    {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_str(format!("Bearer {token}").as_str()).unwrap(),
+        );
+        headers.insert(
+            "x-github-api-version",
+            HeaderValue::from_static("2022-11-28"),
+        );
+    }
+    headers
+}
+
+/// Get HTTP Basic authentication headers from netrc file for the given URL
+fn netrc_headers(url: &Url) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(host) = url.host_str()
+        && let Some((login, password)) = netrc::get_credentials(host)
+    {
+        let credentials = BASE64_STANDARD.encode(format!("{login}:{password}"));
+        if let Ok(value) = HeaderValue::from_str(&format!("Basic {credentials}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
         }
     }
     headers
+}
+
+/// Apply URL replacements based on settings configuration
+/// Supports both simple string replacement and regex patterns (prefixed with "regex:")
+pub fn apply_url_replacements(url: &mut Url) {
+    let settings = Settings::get();
+    if let Some(replacements) = &settings.url_replacements {
+        let url_string = url.to_string();
+
+        for (pattern, replacement) in replacements {
+            if let Some(pattern_without_prefix) = pattern.strip_prefix("regex:") {
+                // Regex replacement
+                if let Ok(regex) = Regex::new(pattern_without_prefix) {
+                    let new_url_string = regex.replace(&url_string, replacement.as_str());
+                    // Only proceed if the URL actually changed
+                    if new_url_string != url_string
+                        && let Ok(new_url) = new_url_string.parse()
+                    {
+                        *url = new_url;
+                        trace!(
+                            "Replaced URL using regex '{}': {} -> {}",
+                            pattern_without_prefix,
+                            url_string,
+                            url.as_str()
+                        );
+                        return; // Apply only the first matching replacement
+                    }
+                } else {
+                    warn!(
+                        "Invalid regex pattern in URL replacement: {}",
+                        pattern_without_prefix
+                    );
+                }
+            } else {
+                // Simple string replacement
+                if url_string.contains(pattern) {
+                    let new_url_string = url_string.replace(pattern, replacement);
+                    // Only proceed if the URL actually changed
+                    if new_url_string != url_string
+                        && let Ok(new_url) = new_url_string.parse()
+                    {
+                        *url = new_url;
+                        trace!(
+                            "Replaced URL using string replacement '{}': {} -> {}",
+                            pattern,
+                            url_string,
+                            url.as_str()
+                        );
+                        return; // Apply only the first matching replacement
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn display_github_rate_limit(resp: &Response) {
@@ -356,5 +552,294 @@ fn display_github_rate_limit(resp: &Response) {
                 retry_after
             );
         }
+    }
+}
+
+fn default_backoff_strategy(retries: i64) -> impl Iterator<Item = std::time::Duration> {
+    ExponentialBackoff::from_millis(10)
+        .map(jitter)
+        .take(retries.max(0) as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use confique::Partial;
+    use indexmap::IndexMap;
+    use url::Url;
+
+    // Mutex to ensure tests don't interfere with each other when modifying global settings
+    static TEST_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Helper to create test settings with specific URL replacements
+    fn with_test_settings<F, R>(replacements: IndexMap<String, String>, test_fn: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        // Lock to prevent parallel tests from interfering with global settings
+        let _guard = TEST_SETTINGS_LOCK.lock().unwrap();
+
+        // Create settings with custom URL replacements
+        let mut settings = crate::config::settings::SettingsPartial::empty();
+        settings.url_replacements = Some(replacements);
+
+        // Set settings for this test
+        crate::config::Settings::reset(Some(settings));
+
+        // Run test
+        let result = test_fn();
+
+        // Clean up after test
+        crate::config::Settings::reset(None);
+
+        result
+    }
+
+    #[test]
+    fn test_simple_string_replacement() {
+        let mut replacements = IndexMap::new();
+        replacements.insert("github.com".to_string(), "my-proxy.com".to_string());
+
+        with_test_settings(replacements, || {
+            let mut url = Url::parse("https://github.com/owner/repo").unwrap();
+            apply_url_replacements(&mut url);
+            assert_eq!(url.as_str(), "https://my-proxy.com/owner/repo");
+        });
+    }
+
+    #[test]
+    fn test_full_url_string_replacement() {
+        let mut replacements = IndexMap::new();
+        replacements.insert(
+            "https://github.com".to_string(),
+            "https://my-proxy.com/artifactory/github-remote".to_string(),
+        );
+
+        with_test_settings(replacements, || {
+            let mut url = Url::parse("https://github.com/owner/repo").unwrap();
+            apply_url_replacements(&mut url);
+            assert_eq!(
+                url.as_str(),
+                "https://my-proxy.com/artifactory/github-remote/owner/repo"
+            );
+        });
+    }
+
+    #[test]
+    fn test_protocol_specific_replacement() {
+        let mut replacements = IndexMap::new();
+        replacements.insert(
+            "https://github.com".to_string(),
+            "https://secure-proxy.com".to_string(),
+        );
+
+        with_test_settings(replacements.clone(), || {
+            // HTTPS gets replaced
+            let mut url1 = Url::parse("https://github.com/owner/repo").unwrap();
+            apply_url_replacements(&mut url1);
+            assert_eq!(url1.as_str(), "https://secure-proxy.com/owner/repo");
+        });
+
+        with_test_settings(replacements, || {
+            // HTTP does not get replaced (no match)
+            let mut url2 = Url::parse("http://github.com/owner/repo").unwrap();
+            apply_url_replacements(&mut url2);
+            assert_eq!(url2.as_str(), "http://github.com/owner/repo");
+        });
+    }
+
+    #[test]
+    fn test_regex_replacement() {
+        let mut replacements = IndexMap::new();
+        replacements.insert(
+            r"regex:https://github\.com".to_string(),
+            "https://my-proxy.com".to_string(),
+        );
+
+        with_test_settings(replacements, || {
+            let mut url = Url::parse("https://github.com/owner/repo").unwrap();
+            apply_url_replacements(&mut url);
+            assert_eq!(url.as_str(), "https://my-proxy.com/owner/repo");
+        });
+    }
+
+    #[test]
+    fn test_regex_with_capture_groups() {
+        let mut replacements = IndexMap::new();
+        replacements.insert(
+            r"regex:https://github\.com/([^/]+)/([^/]+)".to_string(),
+            "https://my-proxy.com/mirror/$1/$2".to_string(),
+        );
+
+        with_test_settings(replacements, || {
+            let mut url = Url::parse("https://github.com/owner/repo/releases").unwrap();
+            apply_url_replacements(&mut url);
+            assert_eq!(
+                url.as_str(),
+                "https://my-proxy.com/mirror/owner/repo/releases"
+            );
+        });
+    }
+
+    #[test]
+    fn test_regex_invalid_replacement_url() {
+        let mut replacements = IndexMap::new();
+        replacements.insert(
+            r"regex:https://github\.com/([^/]+)".to_string(),
+            "not-a-valid-url".to_string(),
+        );
+
+        with_test_settings(replacements, || {
+            // Invalid result URL should be ignored, original URL unchanged
+            let mut url = Url::parse("https://github.com/owner/repo").unwrap();
+            let original = url.clone();
+            apply_url_replacements(&mut url);
+            assert_eq!(url.as_str(), original.as_str());
+        });
+    }
+
+    #[test]
+    fn test_multiple_replacements_first_match_wins() {
+        let mut replacements = IndexMap::new();
+        replacements.insert("github.com".to_string(), "first-proxy.com".to_string());
+        replacements.insert("github".to_string(), "second-proxy.com".to_string());
+
+        with_test_settings(replacements, || {
+            let mut url = Url::parse("https://github.com/owner/repo").unwrap();
+            apply_url_replacements(&mut url);
+            // First replacement should win
+            assert_eq!(url.as_str(), "https://first-proxy.com/owner/repo");
+        });
+    }
+
+    #[test]
+    fn test_no_replacements_configured() {
+        let replacements = IndexMap::new(); // Empty
+
+        with_test_settings(replacements, || {
+            let mut url = Url::parse("https://github.com/owner/repo").unwrap();
+            let original = url.clone();
+            apply_url_replacements(&mut url);
+            assert_eq!(url.as_str(), original.as_str());
+        });
+    }
+
+    #[test]
+    fn test_regex_complex_patterns() {
+        let mut replacements = IndexMap::new();
+        // Convert GitHub releases to JFrog Artifactory
+        replacements.insert(
+            r"regex:https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/(.+)".to_string(),
+            "https://artifactory.company.com/artifactory/github-releases/$1/$2/$3/$4".to_string(),
+        );
+
+        with_test_settings(replacements, || {
+            let mut url =
+                Url::parse("https://github.com/owner/repo/releases/download/v1.0.0/file.tar.gz")
+                    .unwrap();
+            apply_url_replacements(&mut url);
+            assert_eq!(
+                url.as_str(),
+                "https://artifactory.company.com/artifactory/github-releases/owner/repo/v1.0.0/file.tar.gz"
+            );
+        });
+    }
+
+    #[test]
+    fn test_no_settings_configured() {
+        // Test the real apply_url_replacements function with no settings override
+        let _guard = TEST_SETTINGS_LOCK.lock().unwrap();
+        crate::config::Settings::reset(None);
+
+        let mut url = Url::parse("https://github.com/owner/repo").unwrap();
+        let original = url.clone();
+
+        // This should not crash and should leave URL unchanged
+        apply_url_replacements(&mut url);
+        assert_eq!(url.as_str(), original.as_str());
+    }
+
+    #[test]
+    fn test_replacement_affects_full_url_not_just_hostname() {
+        // Test that replacement works on the full URL string, not just hostname
+        let mut replacements = IndexMap::new();
+        replacements.insert(
+            "github.com/owner".to_string(),
+            "proxy.com/mirror".to_string(),
+        );
+
+        with_test_settings(replacements, || {
+            let mut url = Url::parse("https://github.com/owner/repo").unwrap();
+            apply_url_replacements(&mut url);
+            // This demonstrates that replacement happens on full URL, not just hostname
+            assert_eq!(url.as_str(), "https://proxy.com/mirror/repo");
+        });
+    }
+
+    #[test]
+    fn test_path_replacement_example() {
+        // Test replacing part of the path, proving it's not hostname-only
+        let mut replacements = IndexMap::new();
+        replacements.insert("/releases/download/".to_string(), "/artifacts/".to_string());
+
+        with_test_settings(replacements, || {
+            let mut url =
+                Url::parse("https://github.com/owner/repo/releases/download/v1.0.0/file.tar.gz")
+                    .unwrap();
+            apply_url_replacements(&mut url);
+            // Path component was replaced, proving it's full URL replacement
+            assert_eq!(
+                url.as_str(),
+                "https://github.com/owner/repo/artifacts/v1.0.0/file.tar.gz"
+            );
+        });
+    }
+
+    #[test]
+    fn test_documentation_examples() {
+        // Test the examples from the documentation to ensure they work correctly
+
+        // Example 1: Simple hostname replacement
+        let mut replacements = IndexMap::new();
+        replacements.insert("github.com".to_string(), "myregistry.net".to_string());
+
+        with_test_settings(replacements, || {
+            let mut url = Url::parse("https://github.com/user/repo").unwrap();
+            apply_url_replacements(&mut url);
+            assert_eq!(url.as_str(), "https://myregistry.net/user/repo");
+        });
+
+        // Example 2: Protocol + hostname replacement
+        let mut replacements2 = IndexMap::new();
+        replacements2.insert(
+            "https://github.com".to_string(),
+            "https://proxy.corp.com/github-mirror".to_string(),
+        );
+
+        with_test_settings(replacements2, || {
+            let mut url = Url::parse("https://github.com/user/repo").unwrap();
+            apply_url_replacements(&mut url);
+            assert_eq!(
+                url.as_str(),
+                "https://proxy.corp.com/github-mirror/user/repo"
+            );
+        });
+
+        // Example 3: Domain + path replacement
+        let mut replacements3 = IndexMap::new();
+        replacements3.insert(
+            "github.com/releases/download/".to_string(),
+            "cdn.example.com/artifacts/".to_string(),
+        );
+
+        with_test_settings(replacements3, || {
+            let mut url =
+                Url::parse("https://github.com/releases/download/v1.0.0/file.tar.gz").unwrap();
+            apply_url_replacements(&mut url);
+            assert_eq!(
+                url.as_str(),
+                "https://cdn.example.com/artifacts/v1.0.0/file.tar.gz"
+            );
+        });
     }
 }

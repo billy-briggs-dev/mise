@@ -19,6 +19,7 @@ use crate::config::Settings;
 use crate::file::{display_path, modified_duration};
 use crate::hash::hash_to_str;
 use crate::rand::random_string;
+use crate::toolset::env_cache::CachedEnv;
 use crate::{dirs, file};
 
 #[derive(Debug)]
@@ -195,12 +196,11 @@ where
         if !self.cache_file_path.exists() {
             return false;
         }
-        if let Some(fresh_duration) = self.freshest_duration() {
-            if let Ok(metadata) = self.cache_file_path.metadata() {
-                if let Ok(modified) = metadata.modified() {
-                    return modified.elapsed().unwrap_or_default() < fresh_duration;
-                }
-            }
+        if let Some(fresh_duration) = self.freshest_duration()
+            && let Ok(metadata) = self.cache_file_path.metadata()
+            && let Ok(modified) = metadata.modified()
+        {
+            return modified.elapsed().unwrap_or_default() < fresh_duration;
         }
         true
     }
@@ -230,7 +230,7 @@ pub(crate) struct PruneOptions {
 }
 
 pub(crate) fn auto_prune() -> Result<()> {
-    if rand::random::<u8>() % 100 != 0 {
+    if !rand::random::<u8>().is_multiple_of(100) {
         return Ok(()); // only prune 1% of the time
     }
     let settings = Settings::get();
@@ -241,10 +241,10 @@ pub(crate) fn auto_prune() -> Result<()> {
         }
     };
     let auto_prune_file = dirs::CACHE.join(".auto_prune");
-    if let Ok(Ok(modified)) = auto_prune_file.metadata().map(|m| m.modified()) {
-        if modified.elapsed().unwrap_or_default() < age {
-            return Ok(());
-        }
+    if let Ok(Ok(modified)) = auto_prune_file.metadata().map(|m| m.modified())
+        && modified.elapsed().unwrap_or_default() < age
+    {
+        return Ok(());
     }
     let empty = file::ls(*dirs::CACHE).unwrap_or_default().is_empty();
     xx::file::touch_dir(&auto_prune_file)?;
@@ -254,14 +254,22 @@ pub(crate) fn auto_prune() -> Result<()> {
     debug!(
         "pruning old cache files, this behavior can be modified with the MISE_CACHE_PRUNE_AGE setting"
     );
-    prune(
-        *dirs::CACHE,
-        &PruneOptions {
+    let opts = PruneOptions {
+        dry_run: false,
+        verbose: false,
+        age,
+    };
+    prune(*dirs::CACHE, &opts)?;
+    // Also prune env cache using env_cache_ttl
+    let env_cache_dir = CachedEnv::cache_dir();
+    if env_cache_dir.exists() {
+        let env_opts = PruneOptions {
             dry_run: false,
             verbose: false,
-            age,
-        },
-    )?;
+            age: settings.env_cache_ttl(),
+        };
+        prune(&env_cache_dir, &env_opts)?;
+    }
     Ok(())
 }
 

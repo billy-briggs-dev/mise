@@ -47,6 +47,8 @@ impl InstallInto {
             ts: ts.clone(),
             pr: mpr.add(&tv.style()),
             force: true,
+            dry_run: false,
+            locked: false, // install-into doesn't support locked mode
         };
         tv.install_path = Some(self.path.clone());
         backend.install_version(install_ctx, tv).await?;

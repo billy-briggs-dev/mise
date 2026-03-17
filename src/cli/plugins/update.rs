@@ -53,7 +53,7 @@ impl Update {
                 let mpr = MultiProgressReport::get();
                 let pr = mpr.add(&prefix);
                 plugin
-                    .update(&pr, ref_)
+                    .update(pr.as_ref(), ref_)
                     .await
                     .wrap_err_with(|| format!("[{plugin}] plugin update"))?;
                 Ok(())
@@ -79,8 +79,8 @@ impl Update {
 static AFTER_LONG_HELP: &str = color_print::cstr!(
     r#"<bold><underline>Examples:</underline></bold>
 
-    $ <bold>mise plugins update</bold>            # update all plugins
-    $ <bold>mise plugins update node</bold>       # update only node
-    $ <bold>mise plugins update node#beta</bold>  # specify a ref
+    $ <bold>mise plugins update</bold>              # update all plugins
+    $ <bold>mise plugins update cmake</bold>       # update only cmake
+    $ <bold>mise plugins update cmake#beta</bold>  # specify a ref
 "#
 );

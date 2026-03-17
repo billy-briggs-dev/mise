@@ -13,7 +13,9 @@ use crate::cli::args::ToolArg;
 use crate::cmd;
 use crate::config::{Config, Settings};
 use crate::env;
-use crate::toolset::{InstallOptions, ToolsetBuilder};
+use crate::prepare::{PrepareEngine, PrepareOptions};
+use crate::toolset::env_cache::CachedEnv;
+use crate::toolset::{InstallOptions, ResolveOptions, ToolsetBuilder};
 
 /// Execute a command with tool(s) set
 ///
@@ -45,6 +47,14 @@ pub struct Exec {
     #[clap(long, short, env = "MISE_JOBS", verbatim_doc_comment)]
     pub jobs: Option<usize>,
 
+    /// Bypass the environment cache and recompute the environment
+    #[clap(long)]
+    pub fresh_env: bool,
+
+    /// Skip automatic dependency preparation
+    #[clap(long)]
+    pub no_prepare: bool,
+
     /// Directly pipe stdin/stdout/stderr from plugin to user
     /// Sets --jobs=1
     #[clap(long, overrides_with = "jobs")]
@@ -54,14 +64,39 @@ pub struct Exec {
 impl Exec {
     #[async_backtrace::framed]
     pub async fn run(self) -> eyre::Result<()> {
+        // Temporarily unset cache key to force fresh env computation
+        if self.fresh_env {
+            env::reset_env_cache_key();
+        }
+
         let mut config = Config::get().await?;
+
+        // Check if any tool arg explicitly specified @latest
+        // If so, resolve to the actual latest version from the registry (not just latest installed)
+        let has_explicit_latest = self
+            .tool
+            .iter()
+            .any(|t| t.tvr.as_ref().is_some_and(|tvr| tvr.version() == "latest"));
+
+        let resolve_options = if has_explicit_latest {
+            ResolveOptions {
+                latest_versions: true,
+                use_locked_version: false,
+                ..Default::default()
+            }
+        } else {
+            Default::default()
+        };
+
         let mut ts = measure!("toolset", {
             ToolsetBuilder::new()
                 .with_args(&self.tool)
                 .with_default_to_latest(true)
+                .with_resolve_options(resolve_options.clone())
                 .build(&config)
                 .await?
         });
+
         let opts = InstallOptions {
             force: false,
             jobs: self.jobs,
@@ -71,20 +106,50 @@ impl Exec {
             // in that case the user probably just wants that one tool
             missing_args_only: !self.tool.is_empty()
                 || !Settings::get().exec_auto_install
-                || !console::user_attended_stderr()
                 || *env::__MISE_SHIM,
-            resolve_options: Default::default(),
+            skip_auto_install: !Settings::get().exec_auto_install || !Settings::get().auto_install,
+            resolve_options,
             ..Default::default()
         };
-        measure!("install_arg_versions", {
+        let (_, missing) = measure!("install_arg_versions", {
             ts.install_missing_versions(&mut config, &opts).await?
         });
+
+        // If we installed new versions for explicit @latest, re-resolve to pick up the installed versions
+        if has_explicit_latest {
+            ts.resolve_with_opts(&config, &opts.resolve_options).await?;
+        }
+
         measure!("notify_if_versions_missing", {
-            ts.notify_if_versions_missing(&config).await;
+            ts.notify_missing_versions(missing);
         });
 
         let (program, mut args) = parse_command(&env::SHELL, &self.command, &self.c);
-        let env = measure!("env_with_path", { ts.env_with_path(&config).await? });
+
+        let mut env = measure!("env_with_path", { ts.env_with_path(&config).await? });
+
+        // Run auto-enabled prepare steps (unless --no-prepare)
+        if !self.no_prepare {
+            let engine = PrepareEngine::new(&config)?;
+            engine
+                .run(PrepareOptions {
+                    auto_only: true, // Only run providers with auto=true
+                    env: env.clone(),
+                    ..Default::default()
+                })
+                .await?;
+        }
+
+        // Ensure MISE_ENV is set in the spawned shell if it was specified via -E flag
+        if !env::MISE_ENV.is_empty() {
+            env.insert("MISE_ENV".to_string(), env::MISE_ENV.join(","));
+        }
+
+        // Ensure cache key is propagated to subprocesses for env caching
+        if Settings::get().env_cache && !self.fresh_env {
+            let key = CachedEnv::ensure_encryption_key();
+            env.insert("__MISE_ENV_CACHE_KEY".to_string(), key);
+        }
 
         if program.rsplit('/').next() == Some("fish") {
             let mut cmd = vec![];
@@ -124,6 +189,43 @@ where
     }
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let program = program.to_executable();
+    let program = if program.to_string_lossy().contains('/') {
+        // Already a path, no need to resolve
+        program
+    } else {
+        let cwd = crate::dirs::CWD.clone().unwrap_or_default();
+        let lookup_path = env.get(&*env::PATH_KEY).map(|path_val| {
+            // For program resolution, reorder PATH so that paths added by mise
+            // (tool bins, _.path entries) come before paths from the original
+            // system PATH. This prevents wrapper scripts in the system PATH
+            // (e.g. .devcontainer/bin/tool) from being found before the real
+            // tool binary, which would cause infinite recursion and E2BIG.
+            //
+            // User-configured paths (_.path/venv) maintain their position
+            // relative to tool paths since both are "mise-added".
+            // The child process still inherits the full unmodified PATH.
+            let shims_dir = &*crate::dirs::SHIMS;
+            let pristine: std::collections::HashSet<_> = crate::env::PATH.iter().collect();
+            let all_paths: Vec<_> = std::env::split_paths(&OsString::from(path_val)).collect();
+            // Mise-added paths first (preserving relative order)
+            let mise_added: Vec<_> = all_paths
+                .iter()
+                .filter(|p| !pristine.contains(p))
+                .cloned()
+                .collect();
+            // Then original system paths (minus shims)
+            let original: Vec<_> = all_paths
+                .iter()
+                .filter(|p| pristine.contains(p) && *p != shims_dir)
+                .cloned()
+                .collect();
+            std::env::join_paths(mise_added.iter().chain(original.iter())).unwrap()
+        });
+        match which::which_in(&program, lookup_path, cwd) {
+            Ok(resolved) => resolved.into_os_string(),
+            Err(_) => program, // Fall back to original if resolution fails
+        }
+    };
     let err = exec::Command::new(program.clone()).args(&args).exec();
     bail!("{:?} {err}", program.to_string_lossy())
 }
@@ -140,8 +242,52 @@ where
     }
     let cwd = crate::dirs::CWD.clone().unwrap_or_default();
     let program = program.to_executable();
-    let path = env.get(&*env::PATH_KEY).map(OsString::from);
-    let program = which::which_in(program, path, cwd)?;
+    // Reorder PATH for program resolution: mise-added paths first, then
+    // original system paths (minus shims). See Unix version for full rationale.
+    let lookup_path = env.get(&*env::PATH_KEY).map(|path_val| {
+        let shims_normalized = crate::dirs::SHIMS
+            .to_string_lossy()
+            .to_lowercase()
+            .replace('/', "\\");
+        let is_shims = |p: &std::path::PathBuf| {
+            let expanded = crate::file::replace_path(p);
+            expanded.to_string_lossy().to_lowercase().replace('/', "\\") == shims_normalized
+        };
+        let pristine: std::collections::HashSet<_> = crate::env::PATH
+            .iter()
+            .map(|p| {
+                crate::file::replace_path(p)
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .replace('/', "\\")
+            })
+            .collect();
+        let all_paths: Vec<_> = std::env::split_paths(&OsString::from(path_val)).collect();
+        let mise_added: Vec<_> = all_paths
+            .iter()
+            .filter(|p| {
+                let normalized = crate::file::replace_path(p)
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .replace('/', "\\");
+                !pristine.contains(&normalized)
+            })
+            .cloned()
+            .collect();
+        let original: Vec<_> = all_paths
+            .iter()
+            .filter(|p| {
+                let normalized = crate::file::replace_path(p)
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .replace('/', "\\");
+                pristine.contains(&normalized) && !is_shims(p)
+            })
+            .cloned()
+            .collect();
+        std::env::join_paths(mise_added.iter().chain(original.iter())).unwrap()
+    });
+    let program = which::which_in(program, lookup_path, cwd)?;
     let cmd = cmd::cmd(program, args);
 
     // Windows does not support exec in the same way as Unix,
@@ -151,8 +297,9 @@ where
 
     let res = cmd.unchecked().run()?;
     match res.status.code() {
-        Some(0) => Ok(()),
-        Some(code) => Err(eyre!("command failed: exit code {}", code)),
+        Some(code) => {
+            std::process::exit(code);
+        }
         None => Err(eyre!("command failed: terminated by signal")),
     }
 }
@@ -214,13 +361,10 @@ fn parse_command(
             let (program, args) = command.split_first().unwrap();
             (program.clone(), args.into())
         }
-        _ => {
-            #[cfg(unix)]
-            let command_flag = "-c";
-            #[cfg(windows)]
-            let command_flag = "/c";
-            (shell.into(), vec![command_flag.into(), c.clone().unwrap()])
-        }
+        _ => (
+            shell.into(),
+            vec![env::SHELL_COMMAND_FLAG.into(), c.clone().unwrap()],
+        ),
     }
 }
 

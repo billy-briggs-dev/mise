@@ -7,6 +7,8 @@ use serde_json::json;
 use crate::config::Config;
 use crate::file::display_path;
 use crate::task::Task;
+use crate::task::task_fetcher::TaskFetcher;
+use crate::task::task_source_checker::task_cwd;
 use crate::ui::info;
 
 /// Get information about a task
@@ -24,13 +26,30 @@ pub struct TasksInfo {
 impl TasksInfo {
     pub async fn run(self) -> Result<()> {
         let config = Config::get().await?;
-        let tasks = config.tasks().await?;
 
-        let task = tasks
-            .get(&self.task)
-            .or_else(|| tasks.values().find(|task| task.display_name == self.task));
+        let task_name = crate::task::expand_colon_task_syntax(&self.task, &config)?;
+
+        let tasks = if task_name.starts_with("//") {
+            let ctx = crate::task::TaskLoadContext::from_pattern(&task_name);
+            config.tasks_with_context(Some(&ctx)).await?
+        } else {
+            config.tasks().await?
+        };
+
+        let tasks_with_aliases = crate::task::build_task_ref_map(tasks.iter());
+
+        use crate::task::GetMatchingExt;
+        let matching = tasks_with_aliases.get_matching(&task_name).ok();
+        let task = matching.and_then(|m| m.first().cloned().cloned());
 
         if let Some(task) = task {
+            // Resolve remote task files before displaying task info
+            let mut tasks = vec![task.clone()];
+            // always pass no_cache=false as the command doesn't take no-cache argument
+            // MISE_TASK_REMOTE_NO_CACHE env var is still respected if set
+            TaskFetcher::new(false).fetch_tasks(&mut tasks).await?;
+            let task = &tasks[0];
+
             if self.json {
                 self.display_json(&config, task).await?;
             } else {
@@ -38,7 +57,7 @@ impl TasksInfo {
             }
         } else {
             bail!(
-                "Task not found: {}, use `mise tasks ls` to list all tasks",
+                "Task not found: {}, use `mise tasks ls --all --hidden` to list all tasks",
                 self.task
             );
         }
@@ -60,6 +79,9 @@ impl TasksInfo {
         if task.raw {
             properties.push("raw");
         }
+        if task.interactive {
+            properties.push("interactive");
+        }
         if !properties.is_empty() {
             info::inline_section("Properties", properties.join(", "))?;
         }
@@ -75,15 +97,17 @@ impl TasksInfo {
         if !task.sources.is_empty() {
             info::inline_section("Sources", task.sources.join(", "))?;
         }
-        let outputs = task.outputs.paths(task);
+        let root = task_cwd(task, config).await?;
+        let outputs = task.outputs.paths(task, &root);
         if !outputs.is_empty() {
             info::inline_section("Outputs", outputs.join(", "))?;
         }
         if let Some(file) = &task.file {
             info::inline_section("File", display_path(file))?;
         }
-        if !task.run().is_empty() {
-            info::section("Run", task.run().join("\n"))?;
+        let run = task.run();
+        if !run.is_empty() {
+            info::section("Run", run.iter().map(|e| e.to_string()).join("\n"))?;
         }
         if !task.env.is_empty() {
             let env_display = task
@@ -116,6 +140,7 @@ impl TasksInfo {
             "dir": task.dir,
             "hide": task.hide,
             "raw": task.raw,
+            "interactive": task.interactive,
             "sources": task.sources,
             "outputs": task.outputs,
             "shell": task.shell,

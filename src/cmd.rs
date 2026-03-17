@@ -4,14 +4,16 @@ use std::fmt::{Debug, Display, Formatter};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread;
+use std::time::Duration;
 
+use crate::redactions::Redactor;
 use color_eyre::Result;
 use duct::{Expression, IntoExecutablePath};
-use eyre::Context;
-use indexmap::IndexSet;
+use eyre::{Context, bail};
 #[cfg(not(any(test, target_os = "windows")))]
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
 #[cfg(not(any(test, target_os = "windows")))]
@@ -23,6 +25,7 @@ use crate::env;
 use crate::env::PATH_KEY;
 use crate::errors::Error::ScriptFailed;
 use crate::file::display_path;
+use crate::path_env::PathEnv;
 use crate::ui::progress_report::SingleReport;
 
 /// Create a command with any number of of positional arguments
@@ -98,14 +101,128 @@ where
 
 pub struct CmdLineRunner<'a> {
     cmd: Command,
-    pr: Option<&'a Box<dyn SingleReport>>,
+    pr: Option<&'a dyn SingleReport>,
     pr_arc: Option<Arc<Box<dyn SingleReport>>>,
     stdin: Option<String>,
-    redactions: IndexSet<String>,
+    redactor: Redactor,
     raw: bool,
     pass_signals: bool,
     on_stdout: Option<Box<dyn Fn(String) + Send + 'a>>,
     on_stderr: Option<Box<dyn Fn(String) + Send + 'a>>,
+    timeout: Option<Duration>,
+}
+
+const GUARD_RUNNING: u8 = 0;
+const GUARD_CANCELLED: u8 = 1;
+const GUARD_TIMED_OUT: u8 = 2;
+
+fn wait_for_cancel_or_deadline<'a>(
+    cvar: &'a Condvar,
+    mut guard: MutexGuard<'a, bool>,
+    deadline: std::time::Instant,
+) -> (MutexGuard<'a, bool>, bool) {
+    loop {
+        if *guard {
+            return (guard, true);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return (guard, false);
+        }
+        let (g, result) = cvar.wait_timeout(guard, remaining).unwrap();
+        guard = g;
+        if result.timed_out() {
+            return (guard, false);
+        }
+    }
+}
+
+struct TimeoutGuard {
+    state: Arc<AtomicU8>,
+    cancel: Arc<(Mutex<bool>, Condvar)>,
+    timeout: Duration,
+}
+
+impl TimeoutGuard {
+    fn new(timeout: Duration, pid: u32) -> Self {
+        let state = Arc::new(AtomicU8::new(GUARD_RUNNING));
+        let cancel = Arc::new((Mutex::new(false), Condvar::new()));
+        let state_clone = state.clone();
+        let cancel_clone = cancel.clone();
+        thread::spawn(move || {
+            let (lock, cvar) = &*cancel_clone;
+            let guard = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + timeout;
+            let (guard, cancelled) = wait_for_cancel_or_deadline(cvar, guard, deadline);
+            if cancelled {
+                return;
+            }
+            if state_clone
+                .compare_exchange(
+                    GUARD_RUNNING,
+                    GUARD_TIMED_OUT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return;
+            }
+            #[cfg(unix)]
+            {
+                let pid = nix::unistd::Pid::from_raw(pid as i32);
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+                drop(guard);
+                let guard = lock.lock().unwrap();
+                let grace_deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let (_guard, cancelled) = wait_for_cancel_or_deadline(cvar, guard, grace_deadline);
+                if !cancelled {
+                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                }
+            }
+            #[cfg(windows)]
+            {
+                drop(guard);
+                // TODO: Windows lacks graceful shutdown parity with Unix.
+                // Currently force-kills immediately via taskkill /F with no grace period.
+                // Consider using GenerateConsoleCtrlEvent for CTRL_C_EVENT before force kill.
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        });
+        Self {
+            state,
+            cancel,
+            timeout,
+        }
+    }
+
+    fn cancel(&self) {
+        self.state
+            .compare_exchange(
+                GUARD_RUNNING,
+                GUARD_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok();
+        let (lock, cvar) = &*self.cancel;
+        *lock.lock().unwrap() = true;
+        cvar.notify_one();
+    }
+
+    fn timed_out(&self) -> Option<Duration> {
+        (self.state.load(Ordering::Acquire) == GUARD_TIMED_OUT).then_some(self.timeout)
+    }
+}
+
+impl Drop for TimeoutGuard {
+    fn drop(&mut self) {
+        self.cancel();
+    }
 }
 
 static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
@@ -124,11 +241,12 @@ impl<'a> CmdLineRunner<'a> {
             pr: None,
             pr_arc: None,
             stdin: None,
-            redactions: Default::default(),
+            redactor: Default::default(),
             raw: false,
             pass_signals: false,
             on_stdout: None,
             on_stderr: None,
+            timeout: None,
         }
     }
 
@@ -176,9 +294,7 @@ impl<'a> CmdLineRunner<'a> {
     }
 
     pub fn redact(mut self, redactions: impl IntoIterator<Item = String>) -> Self {
-        for r in redactions {
-            self.redactions.insert(r);
-        }
+        self.redactor = self.redactor.with_additional(redactions);
         self
     }
 
@@ -225,11 +341,11 @@ impl<'a> CmdLineRunner<'a> {
             .get_env(&PATH_KEY)
             .map(|c| c.to_owned())
             .unwrap_or_else(|| env::var_os(&*PATH_KEY).unwrap());
-        let paths = paths
-            .into_iter()
-            .chain(env::split_paths(&existing))
-            .collect::<Vec<_>>();
-        self.cmd.env(&*PATH_KEY, env::join_paths(paths)?);
+        let mut path_env = PathEnv::from_iter(env::split_paths(&existing));
+        for p in paths {
+            path_env.add(p);
+        }
+        self.cmd.env(&*PATH_KEY, path_env.join());
         Ok(self)
     }
 
@@ -240,13 +356,6 @@ impl<'a> CmdLineRunner<'a> {
             }
         }
         None
-    }
-
-    pub fn opt_arg<S: AsRef<OsStr>>(mut self, arg: Option<S>) -> Self {
-        if let Some(arg) = arg {
-            self.cmd.arg(arg);
-        }
-        self
     }
 
     pub fn opt_args<S: AsRef<OsStr>>(mut self, arg: &str, values: Option<Vec<S>>) -> Self {
@@ -273,7 +382,7 @@ impl<'a> CmdLineRunner<'a> {
         self
     }
 
-    pub fn with_pr(mut self, pr: &'a Box<dyn SingleReport>) -> Self {
+    pub fn with_pr(mut self, pr: &'a dyn SingleReport) -> Self {
         self.pr = Some(pr);
         self
     }
@@ -288,6 +397,11 @@ impl<'a> CmdLineRunner<'a> {
 
     pub fn with_pass_signals(&mut self) -> &mut Self {
         self.pass_signals = true;
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -308,8 +422,7 @@ impl<'a> CmdLineRunner<'a> {
             return self.execute_raw();
         }
         let mut cp = self
-            .cmd
-            .spawn()
+            .spawn_with_etxtbsy_retry()
             .wrap_err_with(|| format!("failed to execute command: {self}"))?;
         let id = cp.id();
         RUNNING_PIDS.lock().unwrap().insert(id);
@@ -322,7 +435,9 @@ impl<'a> CmdLineRunner<'a> {
                 move || {
                     for line in BufReader::new(stdout).lines() {
                         match line {
-                            Ok(line) => tx.send(ChildProcessOutput::Stdout(line)).unwrap(),
+                            Ok(line) => {
+                                let _ = tx.send(ChildProcessOutput::Stdout(line));
+                            }
                             Err(e) => warn!("Failed to read stdout for {name}: {e}"),
                         }
                     }
@@ -336,7 +451,9 @@ impl<'a> CmdLineRunner<'a> {
                 move || {
                     for line in BufReader::new(stderr).lines() {
                         match line {
-                            Ok(line) => tx.send(ChildProcessOutput::Stderr(line)).unwrap(),
+                            Ok(line) => {
+                                let _ = tx.send(ChildProcessOutput::Stderr(line));
+                            }
                             Err(e) => warn!("Failed to read stderr for {name}: {e}"),
                         }
                     }
@@ -359,7 +476,7 @@ impl<'a> CmdLineRunner<'a> {
             let tx = tx.clone();
             thread::spawn(move || {
                 for sig in &mut signals {
-                    tx.send(ChildProcessOutput::Signal(sig)).unwrap();
+                    let _ = tx.send(ChildProcessOutput::Signal(sig));
                 }
             });
         }
@@ -369,60 +486,103 @@ impl<'a> CmdLineRunner<'a> {
             if let Some(sighandle) = sighandle {
                 sighandle.close();
             }
-            tx.send(ChildProcessOutput::ExitStatus(status)).unwrap();
+            let _ = tx.send(ChildProcessOutput::ExitStatus(status));
         });
+
+        let timeout_guard = self.timeout.map(|t| TimeoutGuard::new(t, id));
 
         let mut combined_output = vec![];
         let mut status = None;
         for line in rx {
             match line {
                 ChildProcessOutput::Stdout(line) => {
-                    let line = self
-                        .redactions
-                        .iter()
-                        .fold(line, |acc, r| acc.replace(r, "[redacted]"));
+                    let line = self.redactor.redact(&line);
                     self.on_stdout(line.clone());
-                    combined_output.push(line);
+                    combined_output.push((line, OutputSource::Stdout));
                 }
                 ChildProcessOutput::Stderr(line) => {
-                    let line = self
-                        .redactions
-                        .iter()
-                        .fold(line, |acc, r| acc.replace(r, "[redacted]"));
+                    let line = self.redactor.redact(&line);
                     self.on_stderr(line.clone());
-                    combined_output.push(line);
+                    combined_output.push((line, OutputSource::Stderr));
                 }
                 ChildProcessOutput::ExitStatus(s) => {
-                    RUNNING_PIDS.lock().unwrap().remove(&id);
                     status = Some(s);
                 }
                 #[cfg(not(any(test, windows)))]
                 ChildProcessOutput::Signal(sig) => {
                     if sig != SIGINT {
-                        debug!("Received signal {sig}, {id}");
+                        debug!("Received signal {sig}, forwarding to {id}");
                         let pid = nix::unistd::Pid::from_raw(id as i32);
                         let sig = nix::sys::signal::Signal::try_from(sig).unwrap();
-                        nix::sys::signal::kill(pid, sig)?;
+                        // Ignore errors — the child may have already exited
+                        // (e.g., killed by TimeoutGuard or exited naturally).
+                        let _ = nix::sys::signal::kill(pid, sig);
                     }
                 }
             }
         }
+        // Removed after rx loop drains (not inside ExitStatus arm) so kill_all
+        // can still reach this PID while output is being processed.
         RUNNING_PIDS.lock().unwrap().remove(&id);
+        if let Some(g) = &timeout_guard {
+            g.cancel();
+        }
+
         let status = status.unwrap();
 
         if !status.success() {
-            self.on_error(combined_output.join("\n"), status)?;
+            if let Some(duration) = timeout_guard.as_ref().and_then(|g| g.timed_out()) {
+                bail!("timed out after {duration:?}");
+            }
+            self.on_error(combined_output, status)?;
         }
 
         Ok(())
     }
 
     fn execute_raw(mut self) -> Result<()> {
-        let status = self.cmd.spawn()?.wait()?;
-        match status.success() {
-            true => Ok(()),
-            false => self.on_error(String::new(), status),
+        let mut cp = self.spawn_with_etxtbsy_retry()?;
+        let timeout_guard = self.timeout.map(|t| TimeoutGuard::new(t, cp.id()));
+        let status = cp.wait()?;
+        if let Some(g) = &timeout_guard {
+            g.cancel();
         }
+        if !status.success() {
+            if let Some(duration) = timeout_guard.as_ref().and_then(|g| g.timed_out()) {
+                bail!("timed out after {duration:?}");
+            }
+            return self.on_error(vec![], status);
+        }
+        Ok(())
+    }
+
+    /// Retry spawning a process if it fails with ETXTBSY (Text file busy).
+    /// This can happen on Linux when executing a binary that was just written/extracted,
+    /// as the file descriptor may not be fully closed yet.
+    fn spawn_with_etxtbsy_retry(&mut self) -> std::io::Result<std::process::Child> {
+        let mut attempt = 0;
+        loop {
+            match self.cmd.spawn() {
+                Ok(child) => return Ok(child),
+                Err(err) if Self::is_etxtbsy(&err) && attempt < 3 => {
+                    attempt += 1;
+                    trace!("retrying spawn after ETXTBSY (attempt {}/3)", attempt);
+                    // Exponential backoff: 50ms, 100ms, 200ms
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (1 << (attempt - 1))));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_etxtbsy(err: &std::io::Error) -> bool {
+        err.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32)
+    }
+
+    #[cfg(not(unix))]
+    fn is_etxtbsy(_err: &std::io::Error) -> bool {
+        false
     }
 
     fn on_stdout(&self, line: String) {
@@ -431,14 +591,20 @@ impl<'a> CmdLineRunner<'a> {
             on_stdout(line);
             return;
         }
-        if let Some(pr) = self.pr.or(self.pr_arc.as_deref()) {
+        if let Some(pr) = self
+            .pr
+            .or(self.pr_arc.as_ref().map(|arc| arc.as_ref().as_ref()))
+        {
             if !line.trim().is_empty() {
                 pr.set_message(line)
             }
-        } else if console::colors_enabled() {
-            println!("{line}\x1b[0m");
         } else {
-            println!("{line}");
+            let mut stdout = std::io::stdout().lock();
+            let _ = if console::colors_enabled() {
+                writeln!(stdout, "{line}\x1b[0m")
+            } else {
+                writeln!(stdout, "{line}")
+            };
         }
     }
 
@@ -448,28 +614,47 @@ impl<'a> CmdLineRunner<'a> {
             on_stderr(line);
             return;
         }
-        match self.pr.or(self.pr_arc.as_deref()) {
+        match self
+            .pr
+            .or(self.pr_arc.as_ref().map(|arc| arc.as_ref().as_ref()))
+        {
             Some(pr) => {
                 if !line.trim().is_empty() {
                     pr.println(line)
                 }
             }
             None => {
-                if console::colors_enabled_stderr() {
-                    eprintln!("{line}\x1b[0m");
+                let mut stderr = std::io::stderr().lock();
+                let _ = if console::colors_enabled_stderr() {
+                    writeln!(stderr, "{line}\x1b[0m")
                 } else {
-                    eprintln!("{line}");
-                }
+                    writeln!(stderr, "{line}")
+                };
             }
         }
     }
 
-    fn on_error(&self, output: String, status: ExitStatus) -> Result<()> {
-        match self.pr.or(self.pr_arc.as_deref()) {
+    fn on_error(&self, output: Vec<(String, OutputSource)>, status: ExitStatus) -> Result<()> {
+        match self
+            .pr
+            .or(self.pr_arc.as_ref().map(|arc| arc.as_ref().as_ref()))
+        {
             Some(pr) => {
                 error!("{} failed", self.get_program());
-                if !Settings::get().verbose && !output.trim().is_empty() {
-                    pr.println(output);
+                if self.on_stdout.is_none() {
+                    // Stdout was hidden behind the progress indicator
+                    // (pr.set_message) so replay it on failure. Only replay
+                    // stdout — stderr was already printed during execution
+                    // via pr.println.
+                    let stdout_only: String = output
+                        .into_iter()
+                        .filter(|(_, source)| matches!(source, OutputSource::Stdout))
+                        .map(|(line, _)| line)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !stdout_only.trim().is_empty() {
+                        pr.println(stdout_only);
+                    }
                 }
             }
             None => {
@@ -505,6 +690,13 @@ impl Debug for CmdLineRunner<'_> {
     }
 }
 
+/// Tracks whether an output line came from stdout or stderr,
+/// so on_error can decide which lines need replaying.
+enum OutputSource {
+    Stdout,
+    Stderr,
+}
+
 enum ChildProcessOutput {
     Stdout(String),
     Stderr(String),
@@ -513,12 +705,94 @@ enum ChildProcessOutput {
     Signal(i32),
 }
 
+/// Run a command asynchronously with `kill_on_drop(true)` so that timeouts
+/// (via `tokio::time::timeout`) actually terminate the subprocess.
+///
+/// This variant **clears** the environment and sets only the provided `env` —
+/// use it for backends that pass a full env from `dependency_env()`.
+pub async fn cmd_read_async<I, K, V>(program: &str, args: &[&str], env: I) -> Result<String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let display_args = args.join(" ");
+    debug!("$ {program} {display_args}");
+
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .env_clear()
+        .envs(env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .wrap_err_with(|| format!("failed to execute command: {program} {display_args}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{program} {display_args} failed: exit code {}\n{}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .wrap_err_with(|| format!("{program} produced invalid UTF-8 output"))?;
+    Ok(stdout.trim_end().to_string())
+}
+
+/// Like [`cmd_read_async`] but **inherits** the current process environment,
+/// only adding the provided extra variables on top.
+///
+/// Use this for core plugins that need the ambient PATH / locale / etc.
+pub async fn cmd_read_async_inherited_env<I, K, V>(
+    program: &str,
+    args: &[&str],
+    extra_env: I,
+) -> Result<String>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let display_args = args.join(" ");
+    debug!("$ {program} {display_args}");
+
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .envs(extra_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .wrap_err_with(|| format!("failed to execute command: {program} {display_args}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{program} {display_args} failed: exit code {}\n{}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .wrap_err_with(|| format!("{program} produced invalid UTF-8 output"))?;
+    Ok(stdout.trim_end().to_string())
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::{cmd, config::Config};
+    use crate::config::Config;
 
     #[tokio::test]
     async fn test_cmd() {

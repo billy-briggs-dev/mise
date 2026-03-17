@@ -18,6 +18,13 @@ pub struct Completion {
     #[clap(long = "shell", short = 's', hide = true)]
     shell_type: Option<Shell>,
 
+    /// Include the bash completion library in the bash completion script
+    ///
+    /// This is required for completions to work in bash, but it is not included by default
+    /// you may source it separately or enable this flag to enable it in the script.
+    #[clap(long, verbatim_doc_comment)]
+    include_bash_completion_lib: bool,
+
     /// Always use usage for completions.
     /// Currently, usage is the default for fish and bash but not zsh since it has a few quirks
     /// to work out first.
@@ -26,13 +33,6 @@ pub struct Completion {
     /// https://usage.jdx.dev
     #[clap(long, verbatim_doc_comment, hide = true)]
     usage: bool,
-
-    /// Include the bash completion library in the bash completion script
-    ///
-    /// This is required for completions to work in bash, but it is not included by default
-    /// you may source it separately or enable this flag to include it in the script.
-    #[clap(long, verbatim_doc_comment)]
-    include_bash_completion_lib: bool,
 }
 
 impl Completion {
@@ -78,6 +78,7 @@ impl Completion {
         match shell {
             Shell::Bash => include_str!("../../completions/mise.bash"),
             Shell::Fish => include_str!("../../completions/mise.fish"),
+            Shell::PowerShell => include_str!("../../completions/mise.ps1"),
             Shell::Zsh => include_str!("../../completions/_mise"),
         }
         .to_string()
@@ -87,23 +88,27 @@ impl Completion {
 static AFTER_LONG_HELP: &str = color_print::cstr!(
     r#"<bold><underline>Examples:</underline></bold>
 
-    $ <bold>mise completion bash > ~/.local/share/bash-completion/completions/mise</bold>
+    $ <bold>mise completion bash --include-bash-completion-lib > ~/.local/share/bash-completion/completions/mise</bold>
     $ <bold>mise completion zsh  > /usr/local/share/zsh/site-functions/_mise</bold>
     $ <bold>mise completion fish > ~/.config/fish/completions/mise.fish</bold>
+    $ <bold>mise completion powershell >> $PROFILE</bold>
 "#
 );
 
 #[derive(Debug, Clone, Copy, EnumString, strum::Display)]
 #[strum(serialize_all = "snake_case")]
+#[allow(clippy::enum_variant_names)] // PowerShell is a proper noun
 enum Shell {
     Bash,
     Fish,
+    #[strum(serialize = "powershell")]
+    PowerShell,
     Zsh,
 }
 
 impl ValueEnum for Shell {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Bash, Self::Fish, Self::Zsh]
+        &[Self::Bash, Self::Fish, Self::PowerShell, Self::Zsh]
     }
     fn to_possible_value(&self) -> Option<PossibleValue> {
         Some(PossibleValue::new(self.to_string()))

@@ -33,7 +33,7 @@ leave = "echo 'I left the project'"
 
 ## Preinstall/postinstall hook
 
-These hooks are run before tools are installed. Unlike other hooks, these hooks do not require `mise activate`.
+These hooks are run before and after tools are installed (respectively). Unlike other hooks, these hooks do not require `mise activate`.
 
 ```toml
 [hooks]
@@ -41,15 +41,75 @@ preinstall = "echo 'I am about to install tools'"
 postinstall = "echo 'I just installed tools'"
 ```
 
+The `postinstall` hook receives a `MISE_INSTALLED_TOOLS` environment variable containing a JSON array of the tools that were just installed:
+
+```toml
+[hooks]
+postinstall = '''
+echo "Installed: $MISE_INSTALLED_TOOLS"
+# Example output: [{"name":"node","version":"20.10.0"},{"name":"python","version":"3.12.0"}]
+'''
+```
+
+## Tool-level postinstall
+
+Individual tools can define their own postinstall scripts using the `postinstall` option. These run immediately after each tool is installed (before other tools in the same session are installed):
+
+```toml
+[tools]
+node = { version = "20", postinstall = "npm install -g pnpm" }
+python = { version = "3.12", postinstall = "pip install pipx" }
+```
+
+Tool-level postinstall scripts receive the following environment variables:
+
+- `MISE_TOOL_NAME`: The short name of the tool (e.g., "node", "python")
+- `MISE_TOOL_VERSION`: The version that was installed (e.g., "20.10.0", "3.12.0")
+- `MISE_TOOL_INSTALL_PATH`: The path where the tool was installed
+
+## Task hooks
+
+Instead of inline scripts, hooks can reference mise tasks. The task is executed as a subprocess
+via `mise run`, so it reuses the full task system including dependencies, environment variables,
+and file-based task definitions.
+
+```toml
+[tasks.setup]
+run = "echo 'setting up project'"
+depends = ["install-deps"]
+
+[hooks]
+enter = { task = "setup" }
+```
+
+You can mix task references with inline scripts in arrays:
+
+```toml
+[hooks]
+enter = ["echo 'entering project'", { task = "setup" }]
+```
+
+Task hooks work with all hook types (`enter`, `leave`, `cd`, `preinstall`, `postinstall`).
+
 ## Watch files hook
 
-While using `mise activate` you can have mise watch files for changes and execute a script when a file changes.
+While using `mise activate` you can have mise watch files for changes and execute a script or task when a file changes.
 
-```bash
+```toml
 [[watch_files]]
 patterns = ["src/**/*.rs"]
 run = "cargo fmt"
 ```
+
+You can also reference a mise task instead of an inline script:
+
+```toml
+[[watch_files]]
+patterns = ["uv.lock"]
+task = "sync-deps"
+```
+
+Each `[[watch_files]]` entry should have either `run` or `task`, but not both.
 
 This hook will have the following environment variables set:
 
@@ -62,6 +122,7 @@ Hooks are executed with the following environment variables set:
 - `MISE_ORIGINAL_CWD`: The directory that the user is in.
 - `MISE_PROJECT_ROOT`: The root directory of the project.
 - `MISE_PREVIOUS_DIR`: The directory that the user was in before the directory change (only if a directory change occurred).
+- `MISE_INSTALLED_TOOLS`: A JSON array of tools that were installed (only for `postinstall` hooks).
 
 ## Shell hooks
 

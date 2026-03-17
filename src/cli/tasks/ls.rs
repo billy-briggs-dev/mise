@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::file::display_rel_path;
 use crate::task::Task;
+use crate::task::task_fetcher::TaskFetcher;
 use crate::ui::table::MiseTable;
 use comfy_table::{Attribute, Cell, Row};
 use eyre::Result;
@@ -19,22 +20,6 @@ use serde_json::json;
 #[derive(Debug, clap::Args)]
 #[clap(verbatim_doc_comment, after_long_help = AFTER_LONG_HELP)]
 pub struct TasksLs {
-    /// Display tasks for usage completion
-    #[clap(long, hide = true)]
-    pub complete: bool,
-
-    /// Show all columns
-    #[clap(short = 'x', long, global = true, verbatim_doc_comment)]
-    pub extended: bool,
-
-    /// Do not print table header
-    #[clap(long, alias = "no-headers", global = true, verbatim_doc_comment)]
-    pub no_header: bool,
-
-    /// Show hidden tasks
-    #[clap(long, global = true, verbatim_doc_comment)]
-    pub hidden: bool,
-
     /// Only show global tasks
     #[clap(
         short,
@@ -58,6 +43,27 @@ pub struct TasksLs {
         verbatim_doc_comment
     )]
     pub local: bool,
+
+    /// Show all columns
+    #[clap(short = 'x', long, global = true, verbatim_doc_comment)]
+    pub extended: bool,
+
+    /// Load all tasks from the entire monorepo, including sibling directories.
+    /// By default, only tasks from the current directory hierarchy are loaded.
+    #[clap(long, global = true, verbatim_doc_comment)]
+    pub all: bool,
+
+    /// Display tasks for usage completion
+    #[clap(long, hide = true)]
+    pub complete: bool,
+
+    /// Show hidden tasks
+    #[clap(long, global = true, verbatim_doc_comment)]
+    pub hidden: bool,
+
+    /// Do not print table header
+    #[clap(long, alias = "no-headers", global = true, verbatim_doc_comment)]
+    pub no_header: bool,
 
     /// Sort by column. Default is name.
     #[clap(long, global = true, value_name = "COLUMN", verbatim_doc_comment)]
@@ -87,9 +93,20 @@ pub enum SortOrder {
 
 impl TasksLs {
     pub async fn run(self) -> Result<()> {
+        use crate::task::TaskLoadContext;
+
         let config = Config::get().await?;
+
+        // Create context based on --all flag or when generating completions/usage specs
+        // to ensure monorepo tasks (e.g., `//app:task`) are available for autocomplete.
+        let ctx = if self.all || self.complete || self.usage {
+            Some(TaskLoadContext::all())
+        } else {
+            None
+        };
+
         let tasks = config
-            .tasks()
+            .tasks_with_context(ctx.as_ref())
             .await?
             .values()
             .filter(|t| self.hidden || !t.hide)
@@ -98,6 +115,12 @@ impl TasksLs {
             .cloned()
             .sorted_by(|a, b| self.sort(a, b))
             .collect::<Vec<Task>>();
+
+        // Resolve remote task files before any operation that may need them
+        let mut tasks = tasks;
+        // always pass no_cache=false as the command doesn't take no-cache argument
+        // MISE_TASK_REMOTE_NO_CACHE env var is still respected if set
+        TaskFetcher::new(false).fetch_tasks(&mut tasks).await?;
 
         if self.complete {
             return self.complete(tasks);
@@ -166,15 +189,20 @@ impl TasksLs {
                   "env": task.env.0.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
                   "dir": task.dir,
                   "hide": task.hide,
+                  "global": task.global,
                   "raw": task.raw,
+                  "interactive": task.interactive,
                   "sources": task.sources,
                   "outputs": task.outputs,
                   "shell": task.shell,
                   "quiet": task.quiet,
                   "silent": task.silent,
                   "tools": task.tools,
-                  "run": task.run(),
-                  "file": task.file,
+                  "usage": task.usage,
+                  "timeout": task.timeout,
+                  "run": task.run_script_strings(),
+                  "args": task.args,
+                  "file": task.file
                 })
             })
             .collect::<serde_json::Value>();

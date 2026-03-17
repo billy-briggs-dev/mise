@@ -26,7 +26,7 @@ pub fn hash_sha256_to_str(s: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn file_hash_sha256(path: &Path, pr: Option<&Box<dyn SingleReport>>) -> Result<String> {
+pub fn file_hash_sha256(path: &Path, pr: Option<&dyn SingleReport>) -> Result<String> {
     let use_external_hasher = file::size(path).unwrap_or_default() > 50 * 1024 * 1024;
     if use_external_hasher && file::which("sha256sum").is_some() {
         let out = cmd!("sha256sum", path).read()?;
@@ -36,11 +36,9 @@ pub fn file_hash_sha256(path: &Path, pr: Option<&Box<dyn SingleReport>>) -> Resu
     }
 }
 
-fn file_hash_prog<D>(path: &Path, pr: Option<&Box<dyn SingleReport>>) -> Result<String>
+fn file_hash_prog<D>(path: &Path, pr: Option<&dyn SingleReport>) -> Result<String>
 where
     D: Digest + Write,
-    D::OutputSize: std::ops::Add,
-    <D::OutputSize as std::ops::Add>::Output: digest::generic_array::ArrayLength<u8>,
 {
     let mut file = file::open(path)?;
     if let Some(pr) = pr {
@@ -60,7 +58,7 @@ where
     }
     std::io::copy(&mut file, &mut hasher)?;
     let hash = hasher.finalize();
-    Ok(format!("{hash:x}"))
+    Ok(hash.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub fn hash_blake3_to_str(s: &str) -> String {
@@ -69,7 +67,7 @@ pub fn hash_blake3_to_str(s: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-pub fn file_hash_blake3(path: &Path, pr: Option<&Box<dyn SingleReport>>) -> Result<String> {
+pub fn file_hash_blake3(path: &Path, pr: Option<&dyn SingleReport>) -> Result<String> {
     let mut file = file::open(path)?;
     if let Some(pr) = pr {
         pr.set_length(file.metadata()?.len());
@@ -93,7 +91,7 @@ pub fn file_hash_blake3(path: &Path, pr: Option<&Box<dyn SingleReport>>) -> Resu
 pub fn ensure_checksum(
     path: &Path,
     checksum: &str,
-    pr: Option<&Box<dyn SingleReport>>,
+    pr: Option<&dyn SingleReport>,
     algo: &str,
 ) -> Result<()> {
     let use_external_hasher = file::size(path).unwrap_or(u64::MAX) > 10 * 1024 * 1024;

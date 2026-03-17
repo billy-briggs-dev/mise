@@ -4,7 +4,7 @@ set -euo pipefail
 
 # Default values
 PACKAGE_NAME="${PACKAGE_NAME:-mise}"
-CHROOTS="${CHROOTS:-fedora-42-aarch64 fedora-42-x86_64 epel-10-aarch64 epel-10-x86_64}"
+CHROOTS="${CHROOTS:-fedora-43-aarch64 fedora-43-x86_64 fedora-42-aarch64 fedora-42-x86_64 epel-10-aarch64 epel-10-x86_64}"
 BUILD_PROFILE="${BUILD_PROFILE:-release}"
 MAINTAINER_NAME="${MAINTAINER_NAME:-mise Release Bot}"
 MAINTAINER_EMAIL="${MAINTAINER_EMAIL:-noreply@mise.jdx.dev}"
@@ -22,7 +22,7 @@ usage() {
 	echo "Options:"
 	echo "  -v, --version VERSION        Package version (required)"
 	echo "  -p, --profile PROFILE        Build profile (default: release)"
-	echo "  -c, --chroots CHROOTS        COPR chroots (default: fedora-42-aarch64 fedora-42-x86_64 epel-10-aarch64 epel-10-x86_64)"
+	echo "  -c, --chroots CHROOTS        COPR chroots (default: fedora-43-aarch64 fedora-43-x86_64 fedora-42-aarch64 fedora-42-x86_64 epel-10-aarch64 epel-10-x86_64)"
 	echo "  -o, --owner OWNER            COPR owner (default: jdxcode)"
 	echo "  -j, --project PROJECT        COPR project (default: mise)"
 	echo "  -n, --name NAME              Package name (default: mise)"
@@ -111,7 +111,6 @@ echo ""
 git config --global user.name "$MAINTAINER_NAME"
 git config --global user.email "$MAINTAINER_EMAIL"
 git config --global --add safe.directory "$REPO_ROOT"
-git config --global --add safe.directory "$REPO_ROOT/aqua-registry"
 
 # Set up COPR configuration if not in dry-run mode
 if [ "$DRY_RUN" != "true" ]; then
@@ -141,19 +140,8 @@ echo "%_tmppath %{_topdir}/tmp" >>~/.rpmmacros
 cd "$BUILD_DIR"
 
 echo "=== Creating Source Tarball ==="
-# Create original source tarball with submodules
+# Create original source tarball
 git -C "$REPO_ROOT" archive --format=tar --prefix="${PACKAGE_NAME}-${VERSION}/" HEAD >"SOURCES/${PACKAGE_NAME}-${VERSION}.tar"
-
-# Add aqua-registry submodule to the tarball
-echo "Adding aqua-registry submodule..."
-# Create a temporary tar file for the submodule
-git -C "$REPO_ROOT/aqua-registry" archive --format=tar --prefix="${PACKAGE_NAME}-${VERSION}/aqua-registry/" HEAD >"SOURCES/aqua-registry-temp.tar"
-
-# Use tar's --concatenate option to properly combine the archives
-tar --concatenate --file="SOURCES/${PACKAGE_NAME}-${VERSION}.tar" "SOURCES/aqua-registry-temp.tar"
-
-# Clean up temporary file
-rm "SOURCES/aqua-registry-temp.tar"
 
 # Compress the tarball
 gzip "SOURCES/${PACKAGE_NAME}-${VERSION}.tar"
@@ -247,7 +235,9 @@ cp completions/mise.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/
 
 # Disable self-update for package manager installations
 mkdir -p %{buildroot}%{_libdir}/mise
-touch %{buildroot}%{_libdir}/mise/.disable-self-update
+cat > %{buildroot}%{_libdir}/mise/mise-self-update-instructions.toml <<'TOML'
+message = "To update mise from COPR, run:\n\n  sudo dnf upgrade mise\n"
+TOML
 
 %files
 %license LICENSE
@@ -257,7 +247,7 @@ touch %{buildroot}%{_libdir}/mise/.disable-self-update
 %{_datadir}/bash-completion/completions/mise
 %{_datadir}/zsh/site-functions/_mise
 %{_datadir}/fish/vendor_completions.d/mise.fish
-%{_libdir}/mise/.disable-self-update
+%{_libdir}/mise/mise-self-update-instructions.toml
 
 %changelog
 * __CHANGELOG_DATE__ __MAINTAINER_NAME__ <__MAINTAINER_EMAIL__> - %{version}-1

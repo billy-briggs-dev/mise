@@ -1,8 +1,13 @@
 # Ubi Backend
 
+::: warning
+The ubi backend is **deprecated**. Please use the [github backend](/dev-tools/backends/github) instead.
+
+To migrate, replace `ubi:owner/repo` with `github:owner/repo` in your configuration files.
+:::
+
 You may install GitHub Releases and URL packages directly using [ubi](https://github.com/houseabsolute/ubi) backend. ubi is directly compiled into
-the mise codebase so it does not need to be installed separately to be used. ubi is preferred over
-plugins for new tools since it doesn't require a plugin, supports Windows, and is really easy to use.
+the mise codebase so it does not need to be installed separately to be used.
 
 ubi doesn't require plugins or even any configuration for each tool. What it does is try to deduce what
 the proper binary/tarball is from GitHub releases and downloads the right one. As long as the vendor
@@ -60,7 +65,7 @@ use the `rename_exe` option to specify the target executable name:
 ### `matching`
 
 Set a string to match against the release filename when there are multiple files for your
-OS/arch, i.e. "gnu" or "musl". Note that this is only used when there is more than one
+OS/arch, i.e. "gnu", "musl", or "msvc". Note that this is only used when there is more than one
 matching release filename for your OS/arch. If only one release asset matches your OS/arch,
 then this will be ignored.
 
@@ -97,7 +102,11 @@ Set the URL for the provider's API. This is useful when using a self-hosted inst
 
 ```toml
 [tools]
-"ubi:acme/my-tool" = { version = "latest", provider= "gitlab", api_url = "https://gitlab.acme.com/api/v4" }
+"ubi:acme/my-tool" = {
+  version = "latest",
+  provider = "gitlab",
+  api_url = "https://gitlab.acme.com/api/v4",
+}
 ```
 
 ### `extract_all`
@@ -116,7 +125,11 @@ This only makes sense when `extract_all` is set to `true`.
 
 ```toml
 [tools]
-"ubi:BurntSushi/ripgrep" = { version = "latest", extract_all = "true", bin_path = "target/release" }
+"ubi:BurntSushi/ripgrep" = {
+  version = "latest",
+  extract_all = "true",
+  bin_path = "target/release",
+}
 ```
 
 **Binary path lookup order:**
@@ -155,7 +168,7 @@ authenticate with the API.
 ### `ubi` resolver can't find os/arch
 
 Sometimes vendors use strange formats for their releases that ubi can't figure out, possibly for a
-specific os/arch combination. For example this recently happend in [this ticket](https://github.com/houseabsolute/ubi/issues/79) because a vendor used
+specific os/arch combination. For example this recently happened in [this ticket](https://github.com/houseabsolute/ubi/issues/79) because a vendor used
 "mac" instead of the more common "macos" or "darwin" tags.
 
 Try using ubi by itself to see if the issue is related to mise or ubi:

@@ -1,17 +1,27 @@
 use crate::Result;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use eyre::eyre;
-use regex::Regex;
 
 use crate::{
     dirs, env,
+    file::display_path,
     git::{self, CloneOptions},
     hash,
+    lock_file::LockFile,
 };
 
 use super::TaskFileProvider;
+
+static SSH_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^git::(?P<url>ssh://((?P<user>[^@]+)@)(?P<host>[^/]+)/(?P<repo>.+)\.git)//(?P<path>[^?]+)(\?ref=(?P<branch>[^?]+))?$").unwrap()
+});
+
+static HTTPS_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^git::(?P<url>https?://(?P<host>[^/]+)/(?P<repo>.+)\.git)//(?P<path>[^?]+)(\?ref=(?P<branch>[^?]+))?$").unwrap()
+});
 
 #[derive(Debug)]
 pub struct RemoteTaskGitBuilder {
@@ -77,61 +87,33 @@ impl RemoteTaskGit {
     }
 
     fn get_repo_structure(&self, file: &str) -> GitRepoStructure {
-        if self.detect_ssh(file).is_ok() {
-            return self.detect_ssh(file).unwrap();
+        if let Some(repo) = Self::parse_ssh(file) {
+            return repo;
         }
-        self.detect_https(file).unwrap()
+        Self::parse_https(file).unwrap()
     }
 
-    fn detect_ssh(&self, file: &str) -> Result<GitRepoStructure> {
-        let re = Regex::new(r"^git::(?P<url>ssh://((?P<user>[^@]+)@)(?P<host>[^/]+)/(?P<repo>.+)\.git)//(?P<path>[^?]+)(\?ref=(?P<branch>[^?]+))?$").unwrap();
-
-        if !re.is_match(file) {
-            return Err(eyre!("Invalid SSH URL"));
-        }
-
-        let captures = re.captures(file).unwrap();
-
+    fn parse_ssh(file: &str) -> Option<GitRepoStructure> {
+        let captures = SSH_REGEX.captures(file)?;
         let url_without_path = captures.name("url").unwrap().as_str();
-
         let path = captures.name("path").unwrap().as_str();
-
-        let branch: Option<String> = captures.name("branch").map(|m| m.as_str().to_string());
-
-        Ok(GitRepoStructure::new(url_without_path, path, branch))
+        let branch = captures.name("branch").map(|m| m.as_str().to_string());
+        Some(GitRepoStructure::new(url_without_path, path, branch))
     }
 
-    fn detect_https(&self, file: &str) -> Result<GitRepoStructure> {
-        let re = Regex::new(r"^git::(?P<url>https://(?P<host>[^/]+)/(?P<repo>.+)\.git)//(?P<path>[^?]+)(\?ref=(?P<branch>[^?]+))?$").unwrap();
-
-        if !re.is_match(file) {
-            return Err(eyre!("Invalid HTTPS URL"));
-        }
-
-        let captures = re.captures(file).unwrap();
-
+    fn parse_https(file: &str) -> Option<GitRepoStructure> {
+        let captures = HTTPS_REGEX.captures(file)?;
         let url_without_path = captures.name("url").unwrap().as_str();
-
         let path = captures.name("path").unwrap().as_str();
-
-        let branch: Option<String> = captures.name("branch").map(|m| m.as_str().to_string());
-
-        Ok(GitRepoStructure::new(url_without_path, path, branch))
+        let branch = captures.name("branch").map(|m| m.as_str().to_string());
+        Some(GitRepoStructure::new(url_without_path, path, branch))
     }
 }
 
 #[async_trait]
 impl TaskFileProvider for RemoteTaskGit {
     fn is_match(&self, file: &str) -> bool {
-        if self.detect_ssh(file).is_ok() {
-            return true;
-        }
-
-        if self.detect_https(file).is_ok() {
-            return true;
-        }
-
-        false
+        SSH_REGEX.is_match(file) || HTTPS_REGEX.is_match(file)
     }
 
     async fn get_local_path(&self, file: &str) -> Result<PathBuf> {
@@ -143,25 +125,31 @@ impl TaskFileProvider for RemoteTaskGit {
 
         debug!("Repo structure: {:?}", repo_structure);
 
-        match self.is_cached {
-            true => {
-                trace!("Cache mode enabled");
+        let _lock = LockFile::new(&destination)
+            .with_callback(|l| {
+                debug!(
+                    "waiting for lock on remote git task cache: {}",
+                    display_path(l)
+                );
+            })
+            .lock()?;
 
-                if full_path.exists() {
-                    debug!("Using cached file: {:?}", full_path);
-                    return Ok(full_path);
-                }
+        if self.is_cached {
+            trace!("Cache mode enabled");
+            if full_path.exists() {
+                debug!("Using cached file: {:?}", full_path);
+                return Ok(full_path);
             }
-            false => {
-                trace!("Cache mode disabled");
-
-                if full_path.exists() {
-                    crate::file::remove_all(&destination)?;
-                }
-            }
+        } else {
+            trace!("Cache mode disabled");
         }
 
-        let git_repo = git::Git::new(destination);
+        let tmp_destination = self.storage_path.join(format!("{}.clone-tmp", &cache_key));
+        if tmp_destination.exists() {
+            crate::file::remove_all(&tmp_destination)?;
+        }
+
+        let git_repo = git::Git::new(&tmp_destination);
 
         let mut clone_options = CloneOptions::default();
 
@@ -170,7 +158,27 @@ impl TaskFileProvider for RemoteTaskGit {
             clone_options = clone_options.branch(branch);
         }
 
-        git_repo.clone(repo_structure.url_without_path.as_str(), clone_options)?;
+        match git_repo.clone(repo_structure.url_without_path.as_str(), clone_options) {
+            Ok(()) => {
+                if destination.exists()
+                    && let Err(e) = crate::file::remove_all(&destination)
+                {
+                    let _ = crate::file::remove_all(&tmp_destination);
+                    return Err(e);
+                }
+                if let Err(e) = std::fs::rename(&tmp_destination, &destination) {
+                    let _ = crate::file::remove_all(&tmp_destination);
+                    return Err(eyre::eyre!(
+                        "failed to move cloned repo into cache at {}: {e}",
+                        display_path(&destination)
+                    ));
+                }
+            }
+            Err(e) => {
+                let _ = crate::file::remove_all(&tmp_destination);
+                return Err(e);
+            }
+        }
 
         Ok(full_path)
     }
@@ -182,9 +190,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_valid_detect_ssh() {
-        let remote_task_git = RemoteTaskGitBuilder::new().build();
-
+    fn test_valid_parse_ssh() {
         let test_cases = vec![
             "git::ssh://git@github.com/myorg/example.git//myfile?ref=v1.0.0",
             "git::ssh://git@github.com/myorg/example.git//terraform/myfile?ref=master",
@@ -194,15 +200,16 @@ mod tests {
         ];
 
         for url in test_cases {
-            let result = remote_task_git.detect_ssh(url);
-            assert!(result.is_ok());
+            assert!(
+                RemoteTaskGit::parse_ssh(url).is_some(),
+                "Failed for: {}",
+                url
+            );
         }
     }
 
     #[test]
-    fn test_invalid_detect_ssh() {
-        let remote_task_git = RemoteTaskGitBuilder::new().build();
-
+    fn test_invalid_parse_ssh() {
         let test_cases = vec![
             "git::ssh://myserver.com/example.git//myfile?ref=master",
             "git::ssh://user@myserver.com/example.git?ref=master",
@@ -211,33 +218,36 @@ mod tests {
         ];
 
         for url in test_cases {
-            let result = remote_task_git.detect_ssh(url);
-            assert!(result.is_err());
+            assert!(
+                RemoteTaskGit::parse_ssh(url).is_none(),
+                "Should fail for: {}",
+                url
+            );
         }
     }
 
     #[test]
-    fn test_valid_detect_https() {
-        let remote_task_git = RemoteTaskGitBuilder::new().build();
-
+    fn test_valid_parse_https() {
         let test_cases = vec![
             "git::https://github.com/myorg/example.git//myfile?ref=v1.0.0",
             "git::https://github.com/myorg/example.git//terraform/myfile?ref=master",
             "git::https://git.acme.com:8080/myorg/example.git//terraform/myfile?ref=master",
             "git::https://myserver.com/example.git//terraform/myfile",
             "git::https://myserver.com/example.git//myfile?ref=master",
+            "git::http://localhost:8080/repo.git//xtasks/lint/ripgrep", // HTTP support for local testing
         ];
 
         for url in test_cases {
-            let result = remote_task_git.detect_https(url);
-            assert!(result.is_ok());
+            assert!(
+                RemoteTaskGit::parse_https(url).is_some(),
+                "Failed for: {}",
+                url
+            );
         }
     }
 
     #[test]
-    fn test_invalid_detect_https() {
-        let remote_task_git = RemoteTaskGitBuilder::new().build();
-
+    fn test_invalid_parse_https() {
         let test_cases = vec![
             "git::https://myserver.com/example.git?ref=master",
             "git::https://user@myserver.com/example.git",
@@ -245,15 +255,16 @@ mod tests {
         ];
 
         for url in test_cases {
-            let result = remote_task_git.detect_https(url);
-            assert!(result.is_err());
+            assert!(
+                RemoteTaskGit::parse_https(url).is_none(),
+                "Should fail for: {}",
+                url
+            );
         }
     }
 
     #[test]
     fn test_extract_ssh_url_information() {
-        let remote_task_git = RemoteTaskGitBuilder::new().build();
-
         let test_cases: Vec<(&str, &str, &str, Option<String>)> = vec![
             (
                 "git::ssh://git@github.com/myorg/example.git//myfile?ref=v1.0.0",
@@ -276,7 +287,7 @@ mod tests {
         ];
 
         for (url, expected_repo, expected_path, expected_branch) in test_cases {
-            let repo = remote_task_git.detect_ssh(url).unwrap();
+            let repo = RemoteTaskGit::parse_ssh(url).unwrap();
             assert_eq!(expected_repo, repo.url_without_path);
             assert_eq!(expected_path, repo.path);
             assert_eq!(expected_branch, repo.branch);
@@ -285,8 +296,6 @@ mod tests {
 
     #[test]
     fn test_extract_https_url_information() {
-        let remote_task_git = RemoteTaskGitBuilder::new().build();
-
         let test_cases: Vec<(&str, &str, &str, Option<String>)> = vec![
             (
                 "git::https://github.com/myorg/example.git//myfile?ref=v1.0.0",
@@ -309,7 +318,7 @@ mod tests {
         ];
 
         for (url, expected_repo, expected_path, expected_branch) in test_cases {
-            let repo = remote_task_git.detect_https(url).unwrap();
+            let repo = RemoteTaskGit::parse_https(url).unwrap();
             assert_eq!(expected_repo, repo.url_without_path);
             assert_eq!(expected_path, repo.path);
             assert_eq!(expected_branch, repo.branch);
@@ -344,8 +353,8 @@ mod tests {
         ];
 
         for (first_url, second_url, expected) in test_cases {
-            let first_repo = remote_task_git.detect_ssh(first_url).unwrap();
-            let second_repo = remote_task_git.detect_ssh(second_url).unwrap();
+            let first_repo = RemoteTaskGit::parse_ssh(first_url).unwrap();
+            let second_repo = RemoteTaskGit::parse_ssh(second_url).unwrap();
             let first_cache_key = remote_task_git.get_cache_key(&first_repo);
             let second_cache_key = remote_task_git.get_cache_key(&second_repo);
             assert_eq!(expected, first_cache_key == second_cache_key);
@@ -380,8 +389,8 @@ mod tests {
         ];
 
         for (first_url, second_url, expected) in test_cases {
-            let first_repo = remote_task_git.detect_https(first_url).unwrap();
-            let second_repo = remote_task_git.detect_https(second_url).unwrap();
+            let first_repo = RemoteTaskGit::parse_https(first_url).unwrap();
+            let second_repo = RemoteTaskGit::parse_https(second_url).unwrap();
             let first_cache_key = remote_task_git.get_cache_key(&first_repo);
             let second_cache_key = remote_task_git.get_cache_key(&second_repo);
             assert_eq!(expected, first_cache_key == second_cache_key);

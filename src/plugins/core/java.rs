@@ -4,7 +4,7 @@ use std::fs::{self};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, VersionInfo, normalize_idiomatic_contents};
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
 use crate::cli::version::OS;
@@ -22,13 +22,14 @@ use indoc::formatdoc;
 use itertools::Itertools;
 use regex::Regex;
 use serde_derive::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::LazyLock as Lazy;
 use versions::Versioning;
 use xx::regex;
 
 static VERSION_REGEX: Lazy<regex::Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)(^Available versions:|-src|-dev|-latest|-stm|[-\\.]rc|-milestone|-alpha|-beta|[-\\.]pre|-next|snapshot|SNAPSHOT|master)"
+        r"(?i)(^Available versions:|-src|-dev|-latest|-stm|[-\\.]rc|-milestone|-alpha|-beta|[-\\.]pre|-next|-test|snapshot|SNAPSHOT|master)"
     )
         .unwrap()
 });
@@ -75,7 +76,7 @@ impl JavaPlugin {
 
                 for m in self.download_java_metadata(&release_type).await? {
                     // add openjdk short versions like "java@17.0.0" which default to openjdk
-                    if m.vendor == "openjdk" {
+                    if m.vendor == Settings::get().java.shorthand_vendor {
                         metadata.insert(m.version.to_string(), m.clone());
                     }
                     metadata.insert(m.to_string(), m);
@@ -90,7 +91,7 @@ impl JavaPlugin {
         tv.install_path().join("bin/java")
     }
 
-    fn test_java(&self, tv: &ToolVersion, pr: &Box<dyn SingleReport>) -> Result<()> {
+    fn test_java(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<()> {
         CmdLineRunner::new(self.java_bin(tv))
             .with_pr(pr)
             .env("JAVA_HOME", tv.install_path())
@@ -102,7 +103,7 @@ impl JavaPlugin {
         &self,
         ctx: &InstallContext,
         tv: &mut ToolVersion,
-        pr: &Box<dyn SingleReport>,
+        pr: &dyn SingleReport,
         m: &JavaMetadata,
     ) -> Result<PathBuf> {
         let filename = m.url.split('/').next_back().unwrap();
@@ -127,7 +128,7 @@ impl JavaPlugin {
     fn install(
         &self,
         tv: &ToolVersion,
-        pr: &Box<dyn SingleReport>,
+        pr: &dyn SingleReport,
         tarball_path: &Path,
         m: &JavaMetadata,
     ) -> Result<()> {
@@ -139,9 +140,10 @@ impl JavaPlugin {
                 tarball_path,
                 &tv.download_path(),
                 &TarOptions {
-                    format: TarFormat::Auto,
                     pr: Some(pr),
-                    ..Default::default()
+                    ..TarOptions::new(TarFormat::from_file_name(
+                        &tarball_path.file_name().unwrap().to_string_lossy(),
+                    ))
                 },
             )?,
         }
@@ -233,7 +235,7 @@ impl JavaPlugin {
         Ok(())
     }
 
-    fn verify(&self, tv: &ToolVersion, pr: &Box<dyn SingleReport>) -> Result<()> {
+    fn verify(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<()> {
         pr.set_message("java -version".into());
         self.test_java(tv, pr)
     }
@@ -242,14 +244,14 @@ impl JavaPlugin {
         tv.request
             .options()
             .get("release_type")
-            .cloned()
+            .map(|s| s.to_string())
             .unwrap_or(String::from("ga"))
     }
 
     fn tv_to_java_version(&self, tv: &ToolVersion) -> String {
         if regex!(r"^\d").is_match(&tv.version) {
             // undo openjdk shorthand
-            format!("openjdk-{}", tv.version)
+            format!("{}-{}", Settings::get().java.shorthand_vendor, tv.version)
         } else {
             tv.version.clone()
         }
@@ -295,41 +297,75 @@ impl Backend for JavaPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
-        // TODO: find out how to get this to work for different os/arch
-        // See https://github.com/jdx/mise/issues/1196
-        // match self.core.fetch_remote_versions_from_mise() {
-        //     Ok(Some(versions)) => return Ok(versions),
-        //     Ok(None) => {}
-        //     Err(e) => warn!("failed to fetch remote versions: {}", e),
-        // }
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+        let release_type = config
+            .get_tool_request_set()
+            .await?
+            .list_tools()
+            .iter()
+            .find(|ba| ba.short == "java")
+            .and_then(|ba| ba.opts().get("release_type").map(|s| s.to_string()))
+            .unwrap_or_else(|| "ga".to_string());
+
         let versions = self
-            .fetch_java_metadata("ga")
+            .fetch_java_metadata(&release_type)
             .await?
             .iter()
             .sorted_by_cached_key(|(v, m)| {
                 let is_shorthand = regex!(r"^\d").is_match(v);
                 let vendor = &m.vendor;
-                let is_jdk = m
-                    .image_type
-                    .as_ref()
-                    .is_some_and(|image_type| image_type == "jdk");
+                let is_jdk = match is_shorthand {
+                    true => true,
+                    false => m
+                        .image_type
+                        .as_ref()
+                        .is_some_and(|image_type| image_type == "jdk"),
+                };
                 let features = 10 - m.features.as_ref().map_or(0, |f| f.len());
                 let version = Versioning::new(v);
+                // Extract build suffix after a '+', '.' if present. If not present, treat as 0.
+                let build_num = v
+                    .rsplit_once('+')
+                    .or_else(|| v.rsplit_once('.'))
+                    .and_then(|(_, tail)| {
+                        // take leading digits of tail
+                        let digits: String =
+                            tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        if digits.is_empty() {
+                            None
+                        } else {
+                            u64::from_str(&digits).ok()
+                        }
+                    })
+                    .unwrap_or(0u64);
                 (
                     is_shorthand,
                     vendor,
                     is_jdk,
                     features,
                     version,
+                    build_num,
                     v.to_string(),
                 )
             })
-            .map(|(v, _)| v.clone())
-            .unique()
+            .map(|(v, m)| VersionInfo {
+                version: v.clone(),
+                created_at: m.created_at.clone(),
+                ..Default::default()
+            })
+            .unique_by(|v| v.version.clone())
             .collect();
 
         Ok(versions)
+    }
+
+    /// Override to bypass the shared remote_versions cache since Java has separate
+    /// caches for GA and EA release types in fetch_java_metadata.
+    async fn list_remote_versions_with_info(
+        &self,
+        config: &Arc<Config>,
+    ) -> Result<Vec<VersionInfo>> {
+        self._list_remote_versions(config).await
     }
 
     fn list_installed_versions_matching(&self, query: &str) -> Vec<String> {
@@ -347,15 +383,15 @@ impl Backend for JavaPlugin {
     }
 
     fn get_aliases(&self) -> Result<BTreeMap<String, String>> {
-        let aliases = BTreeMap::from([("lts".into(), "21".into())]);
+        let aliases = BTreeMap::from([("lts".into(), "25".into())]);
         Ok(aliases)
     }
 
-    fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         Ok(vec![".java-version".into(), ".sdkmanrc".into()])
     }
 
-    fn parse_idiomatic_file(&self, path: &Path) -> Result<String> {
+    async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let contents = file::read_to_string(path)?;
         if path.file_name() == Some(".sdkmanrc".as_ref()) {
             let version = contents
@@ -366,7 +402,7 @@ impl Backend for JavaPlugin {
                 .unwrap_or_default()
                 .1;
             if !version.contains('-') {
-                return Ok(version.to_string());
+                return Ok(vec![version.to_string()]);
             }
             let (version, vendor) = version.rsplit_once('-').unwrap_or_default();
             let vendor = match vendor {
@@ -386,9 +422,12 @@ impl Backend for JavaPlugin {
             if vendor == "zulu" {
                 version = version.split_once('.').unwrap_or_default().0;
             }
-            Ok(format!("{vendor}-{version}"))
+            Ok(vec![format!("{vendor}-{version}")])
         } else {
-            Ok(contents)
+            Ok(normalize_idiomatic_contents(&contents)
+                .lines()
+                .map(|s| s.to_string())
+                .collect())
         }
     }
 
@@ -411,7 +450,7 @@ impl Backend for JavaPlugin {
                     if !tarball_path.exists() {
                         debug!("File not found, downloading from cached URL: {}", url);
                         // Download using the lockfile URL, not JavaMetadata
-                        HTTP.download_file(url, &tarball_path, Some(&ctx.pr))
+                        HTTP.download_file(url, &tarball_path, Some(ctx.pr.as_ref()))
                             .await?;
                         // Optionally verify checksum if present
                         self.verify_checksum(ctx, &mut tv, &tarball_path)?;
@@ -423,17 +462,23 @@ impl Backend for JavaPlugin {
                 } else {
                     // No URL in lockfile, fallback to metadata
                     let metadata = self.tv_to_metadata(&tv).await?;
-                    let tarball_path = self.download(ctx, &mut tv, &ctx.pr, metadata).await?;
+                    let tarball_path = self
+                        .download(ctx, &mut tv, ctx.pr.as_ref(), metadata)
+                        .await?;
                     (metadata, tarball_path)
                 }
             } else {
                 let metadata = self.tv_to_metadata(&tv).await?;
-                let tarball_path = self.download(ctx, &mut tv, &ctx.pr, metadata).await?;
+                let tarball_path = self
+                    .download(ctx, &mut tv, ctx.pr.as_ref(), metadata)
+                    .await?;
                 (metadata, tarball_path)
             };
 
-        self.install(&tv, &ctx.pr, &tarball_path, metadata)?;
-        self.verify(&tv, &ctx.pr)?;
+        ctx.pr.next_operation();
+        self.install(&tv, ctx.pr.as_ref(), &tarball_path, metadata)?;
+        ctx.pr.next_operation();
+        self.verify(&tv, ctx.pr.as_ref())?;
 
         Ok(tv)
     }
@@ -452,19 +497,21 @@ impl Backend for JavaPlugin {
     }
 
     fn fuzzy_match_filter(&self, versions: Vec<String>, query: &str) -> Vec<String> {
-        let query_trim = regex::escape(query.trim_end_matches('-'));
-        let query_version = format!("{}[0-9.]+", regex::escape(query));
-        let query_trim_version = format!("{query_trim}-[0-9.]+");
+        let is_vendor_prefix = query != "latest" && query.ends_with('-');
+        let query_escaped = regex::escape(query);
         let query = match query {
             "latest" => "[0-9].*",
-            // ends with a dash; use <query><version>
-            q if q.ends_with('-') => &query_version,
-            // not a shorthand version; use <query>-<version>
-            q if regex!("^[a-zA-Z]+$").is_match(q) => &query_trim_version,
-            // else; use trimmed query
-            _ => &query_trim,
+            // else; use escaped query
+            _ => &query_escaped,
         };
-        let query_regex = Regex::new(&format!("^{query}([+-.].+)?$")).unwrap();
+        // Same semantics as Backend::fuzzy_match_filter:
+        // - "1.2" should match "1.2.3" but not "1.20"
+        // - vendor prefixes like "temurin-" should match "temurin-25..."
+        let query_regex = if is_vendor_prefix {
+            Regex::new(&format!("^{query}.*$")).unwrap()
+        } else {
+            Regex::new(&format!("^{query}([+\\-.].+)?$")).unwrap()
+        };
 
         versions
             .into_iter()
@@ -484,6 +531,8 @@ impl Backend for JavaPlugin {
 fn os() -> &'static str {
     if cfg!(target_os = "macos") {
         "macosx"
+    } else if OS.as_str() == "freebsd" {
+        "linux"
     } else {
         &OS
     }
@@ -504,11 +553,12 @@ struct JavaMetadata {
     // architecture: String,
     checksum: Option<String>,
     // checksum_url: Option<String>,
+    created_at: Option<String>,
     features: Option<Vec<String>>,
     file_type: Option<String>,
     // filename: String,
     image_type: Option<String>,
-    // java_version: String,
+    java_version: String,
     jvm_impl: String,
     // os: String,
     // release_type: String,
@@ -539,6 +589,14 @@ impl Display for JavaMetadata {
         }
         if self.jvm_impl == "openj9" {
             v.push(self.jvm_impl.clone());
+        }
+        if self.vendor == "liberica-nik" {
+            let major = self
+                .java_version
+                .split('.')
+                .next()
+                .unwrap_or(&self.java_version);
+            v.push(format!("openjdk{}", major));
         }
         v.push(self.version.clone());
         write!(f, "{}", v.join("-"))

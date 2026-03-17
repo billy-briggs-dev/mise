@@ -2,16 +2,21 @@ use std::sync::Arc;
 
 use crate::backend::pipx::PIPXBackend;
 use crate::cli::args::ToolArg;
-use crate::config::{Config, config_file};
+use crate::config::{Config, Settings, config_file};
+use crate::duration::parse_into_timestamp;
 use crate::file::display_path;
 use crate::toolset::outdated_info::OutdatedInfo;
-use crate::toolset::{InstallOptions, ResolveOptions, ToolVersion, ToolsetBuilder};
+use crate::toolset::{
+    ConfigScope, InstallOptions, ResolveOptions, ToolVersion, ToolsetBuilder,
+    get_versions_needed_by_tracked_configs,
+};
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
-use crate::{config, ui};
+use crate::{config, exit, runtime_symlinks, ui};
 use console::Term;
 use demand::DemandOption;
 use eyre::{Context, Result, eyre};
+use jiff::Timestamp;
 
 /// Upgrades outdated tools
 ///
@@ -26,12 +31,8 @@ pub struct Upgrade {
     /// Tool(s) to upgrade
     /// e.g.: node@20 python@3.10
     /// If not specified, all current tools will be upgraded
-    #[clap(value_name = "TOOL@VERSION", verbatim_doc_comment)]
+    #[clap(value_name = "INSTALLED_TOOL@VERSION", verbatim_doc_comment)]
     tool: Vec<ToolArg>,
-
-    /// Just print what would be done, don't actually do it
-    #[clap(long, short = 'n', verbatim_doc_comment)]
-    dry_run: bool,
 
     /// Display multiselect menu to choose which tools to upgrade
     #[clap(long, short, verbatim_doc_comment, conflicts_with = "tool")]
@@ -52,6 +53,38 @@ pub struct Upgrade {
     #[clap(long, short = 'l', verbatim_doc_comment)]
     bump: bool,
 
+    /// Just print what would be done, don't actually do it
+    #[clap(long, short = 'n', verbatim_doc_comment)]
+    dry_run: bool,
+
+    /// Tool(s) to exclude from upgrading
+    /// e.g.: go python
+    #[clap(long, short = 'x', value_name = "INSTALLED_TOOL", verbatim_doc_comment)]
+    exclude: Vec<ToolArg>,
+
+    /// Only upgrade to versions released before this date
+    ///
+    /// Supports absolute dates like "2024-06-01" and relative durations like "90d" or "1y".
+    /// This can be useful for reproducibility or security purposes.
+    ///
+    /// This only affects fuzzy version matches like "20" or "latest".
+    /// Explicitly pinned versions like "22.5.0" are not filtered.
+    #[clap(long, verbatim_doc_comment)]
+    before: Option<String>,
+
+    /// Like --dry-run but exits with code 1 if there are outdated tools
+    ///
+    /// This is useful for scripts to check if tools need to be upgraded.
+    #[clap(long, verbatim_doc_comment)]
+    dry_run_code: bool,
+
+    /// Only upgrade tools defined in local config files
+    ///
+    /// This will only upgrade tools that are defined in project-local mise.toml and
+    /// will skip tools defined in the global config (~/.config/mise/config.toml).
+    #[clap(long, verbatim_doc_comment)]
+    local: bool,
+
     /// Directly pipe stdin/stdout/stderr from plugin to user
     /// Sets --jobs=1
     #[clap(long, overrides_with = "jobs")]
@@ -59,21 +92,48 @@ pub struct Upgrade {
 }
 
 impl Upgrade {
+    fn is_dry_run(&self) -> bool {
+        self.dry_run || self.dry_run_code
+    }
+
+    fn scope(&self) -> ConfigScope {
+        if self.local {
+            ConfigScope::LocalOnly
+        } else {
+            ConfigScope::All
+        }
+    }
+
     pub async fn run(self) -> Result<()> {
         let mut config = Config::get().await?;
         let ts = ToolsetBuilder::new()
             .with_args(&self.tool)
+            .with_scope(self.scope())
             .build(&config)
             .await?;
-        let mut outdated = ts.list_outdated_versions(&config, self.bump).await;
+        // Compute before_date once to ensure consistency when using relative durations
+        let before_date = self.get_before_date()?;
+        let opts = ResolveOptions {
+            use_locked_version: false,
+            latest_versions: true,
+            before_date,
+        };
+        // Filter tools to check before doing expensive version lookups
+        let filter_tools = if !self.interactive && !self.tool.is_empty() {
+            Some(self.tool.as_slice())
+        } else {
+            None
+        };
+        let exclude_tools = if !self.exclude.is_empty() {
+            Some(self.exclude.as_slice())
+        } else {
+            None
+        };
+        let mut outdated = ts
+            .list_outdated_versions_filtered(&config, self.bump, &opts, filter_tools, exclude_tools)
+            .await;
         if self.interactive && !outdated.is_empty() {
             outdated = self.get_interactive_tool_set(&outdated)?;
-        } else if !self.tool.is_empty() {
-            outdated.retain(|o| {
-                self.tool
-                    .iter()
-                    .any(|t| t.ba.as_ref() == o.tool_version.ba())
-            });
         }
         if outdated.is_empty() {
             info!("All tools are up to date");
@@ -85,53 +145,66 @@ impl Upgrade {
                 );
             }
         } else {
-            self.upgrade(&mut config, outdated).await?;
+            self.upgrade(&mut config, outdated, before_date).await?;
         }
 
         Ok(())
     }
 
-    async fn upgrade(&self, config: &mut Arc<Config>, outdated: Vec<OutdatedInfo>) -> Result<()> {
+    async fn upgrade(
+        &self,
+        config: &mut Arc<Config>,
+        outdated: Vec<OutdatedInfo>,
+        before_date: Option<Timestamp>,
+    ) -> Result<()> {
         let mpr = MultiProgressReport::get();
         let mut ts = ToolsetBuilder::new()
             .with_args(&self.tool)
+            .with_scope(self.scope())
             .build(config)
             .await?;
 
-        let config_file_updates = outdated
-            .iter()
-            .filter_map(|o| {
-                if let (Some(path), Some(_bump)) = (o.source.path(), &o.bump) {
-                    match config_file::parse(path) {
-                        Ok(cf) => Some((o, cf)),
-                        Err(e) => {
-                            warn!("failed to parse {}: {e}", display_path(path));
-                            None
-                        }
-                    }
-                } else {
-                    None
+        let mut outdated_with_config_files: Vec<(&OutdatedInfo, Arc<dyn config_file::ConfigFile>)> =
+            vec![];
+        for o in outdated.iter() {
+            if let (Some(path), Some(_bump)) = (o.source.path(), &o.bump) {
+                match config_file::parse(path).await {
+                    Ok(cf) => outdated_with_config_files.push((o, cf)),
+                    Err(e) => warn!("failed to parse {}: {e}", display_path(path)),
                 }
-            })
+            }
+        }
+        let config_file_updates = outdated_with_config_files
+            .iter()
             .filter(|(o, cf)| {
-                if let Ok(trs) = cf.to_tool_request_set() {
-                    if let Some(versions) = trs.tools.get(o.tool_request.ba()) {
-                        if versions.len() != 1 {
-                            warn!("upgrading multiple versions with --bump is not yet supported");
-                            return false;
-                        }
-                    }
+                if let Ok(trs) = cf.to_tool_request_set()
+                    && let Some(versions) = trs.tools.get(o.tool_request.ba())
+                    && versions.len() != 1
+                {
+                    warn!("upgrading multiple versions with --bump is not yet supported");
+                    return false;
                 }
                 true
             })
             .collect::<Vec<_>>();
 
-        let to_remove = outdated
+        // Determine which old versions should be uninstalled after upgrade
+        // Skip uninstall when current == latest (channel-based versions that update in-place)
+        let to_remove: Vec<_> = outdated
             .iter()
-            .filter_map(|o| o.current.as_ref().map(|current| (o, current)))
-            .collect::<Vec<_>>();
+            .filter_map(|o| {
+                o.current.as_ref().and_then(|current| {
+                    // Skip if current and latest version strings are identical
+                    // This handles channels like "nightly", "stable", "beta" that update in-place
+                    if &o.latest == current {
+                        return None;
+                    }
+                    Some((o, current.clone()))
+                })
+            })
+            .collect();
 
-        if self.dry_run {
+        if self.is_dry_run() {
             for (o, current) in &to_remove {
                 miseprintln!("Would uninstall {}@{}", o.name, current);
             }
@@ -146,18 +219,21 @@ impl Upgrade {
                     display_path(cf.get_path())
                 );
             }
+            if self.dry_run_code {
+                exit::exit(1);
+            }
             return Ok(());
         }
 
         let opts = InstallOptions {
             reason: "upgrade".to_string(),
-            // TODO: can we remove this without breaking e2e/cli/test_upgrade? it may be causing tools to re-install
-            force: true,
+            force: false,
             jobs: self.jobs,
             raw: self.raw,
             resolve_options: ResolveOptions {
                 use_locked_version: false,
                 latest_versions: true,
+                before_date,
             },
             ..Default::default()
         };
@@ -196,15 +272,42 @@ impl Upgrade {
             }
         }
 
+        // Reset config after upgrades so tracked configs resolve with new versions
+        *config = Config::reset().await?;
+
+        // Rebuild symlinks BEFORE getting versions needed by tracked configs
+        // This ensures "latest" symlinks point to the new versions, not the old ones
+        runtime_symlinks::rebuild(config)
+            .await
+            .wrap_err("failed to rebuild runtime symlinks")?;
+
+        // Get versions needed by tracked configs AFTER upgrade
+        // This ensures we don't uninstall versions still needed by other projects
+        let versions_needed_by_tracked = get_versions_needed_by_tracked_configs(config).await?;
+
         // Only uninstall old versions of tools that were successfully upgraded
+        // and are not needed by any tracked config
         for (o, tv) in to_remove {
             if successful_versions
                 .iter()
                 .any(|v| v.ba() == o.tool_version.ba())
             {
+                // Check if this version is still needed by another tracked config
+                let version_key = (
+                    o.tool_version.ba().short.to_string(),
+                    o.tool_version.tv_pathname(),
+                );
+                if versions_needed_by_tracked.contains(&version_key) {
+                    debug!(
+                        "Keeping {}@{} because it's still needed by a tracked config",
+                        o.name, tv
+                    );
+                    continue;
+                }
+
                 let pr = mpr.add(&format!("uninstall {}@{}", o.name, tv));
                 if let Err(e) = self
-                    .uninstall_old_version(config, &o.tool_version, &pr)
+                    .uninstall_old_version(config, &o.tool_version, pr.as_ref())
                     .await
                 {
                     warn!("Failed to uninstall old version of {}: {}", o.name, e);
@@ -212,7 +315,6 @@ impl Upgrade {
             }
         }
 
-        *config = Config::reset().await?;
         let ts = config.get_toolset().await?;
         config::rebuild_shims_and_runtime_symlinks(config, ts, &successful_versions).await?;
 
@@ -224,6 +326,8 @@ impl Upgrade {
                 });
         }
 
+        Self::print_summary(&outdated, &successful_versions)?;
+
         install_error
     }
 
@@ -231,7 +335,7 @@ impl Upgrade {
         &self,
         config: &Arc<Config>,
         tv: &ToolVersion,
-        pr: &Box<dyn SingleReport>,
+        pr: &dyn SingleReport,
     ) -> Result<()> {
         tv.backend()?
             .uninstall_version(config, tv, pr, self.dry_run)
@@ -241,11 +345,33 @@ impl Upgrade {
         Ok(())
     }
 
+    fn print_summary(outdated: &[OutdatedInfo], successful_versions: &[ToolVersion]) -> Result<()> {
+        let upgraded: Vec<_> = outdated
+            .iter()
+            .filter(|o| {
+                successful_versions
+                    .iter()
+                    .any(|v| v.ba() == o.tool_version.ba() && v.version == o.latest)
+            })
+            .collect();
+        if !upgraded.is_empty() {
+            let s = if upgraded.len() == 1 { "" } else { "s" };
+            miseprintln!("\nUpgraded {} tool{}:", upgraded.len(), s);
+            for o in &upgraded {
+                let from = o.current.as_deref().unwrap_or("(none)");
+                miseprintln!("  {} {} → {}", o.name, from, o.latest);
+            }
+        }
+        Ok(())
+    }
+
     fn get_interactive_tool_set(&self, outdated: &Vec<OutdatedInfo>) -> Result<Vec<OutdatedInfo>> {
         ui::ctrlc::show_cursor_after_ctrl_c();
+        let theme = crate::ui::theme::get_theme();
         let mut ms = demand::MultiSelect::new("mise upgrade")
             .description("Select tools to upgrade")
-            .filterable(true);
+            .filterable(true)
+            .theme(&theme);
         for out in outdated {
             ms = ms.option(DemandOption::new(out.clone()));
         }
@@ -256,6 +382,19 @@ impl Upgrade {
                 Err(eyre!(e))
             }
         }
+    }
+
+    /// Get the before_date from CLI flag or settings
+    fn get_before_date(&self) -> Result<Option<Timestamp>> {
+        // CLI flag takes precedence over settings
+        if let Some(before) = &self.before {
+            return Ok(Some(parse_into_timestamp(before)?));
+        }
+        // Fall back to settings
+        if let Some(before) = &Settings::get().install_before {
+            return Ok(Some(parse_into_timestamp(before)?));
+        }
+        Ok(None)
     }
 }
 
@@ -280,7 +419,13 @@ static AFTER_LONG_HELP: &str = color_print::cstr!(
     # Upgrades node and python to the latest versions
     $ <bold>mise upgrade node python</bold>
 
+    # Upgrade all tools except go
+    $ <bold>mise upgrade --exclude go</bold>
+
     # Show a multiselect menu to choose which tools to upgrade
     $ <bold>mise upgrade --interactive</bold>
+
+    # Only upgrade tools defined in local mise.toml, not global ones
+    $ <bold>mise upgrade --local</bold>
 "#
 );

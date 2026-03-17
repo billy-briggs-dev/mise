@@ -50,13 +50,13 @@ detected with your setup. If you submit a bug report, please include the output 
 
 Likely this means that mise isn't first in PATH—using shims or `mise activate`. You can verify if
 this is the case by calling `which -a`, for example, if node@20.0.0 is being used but mise specifies
-node@22.0.0, first make sure that mise has this version installed and active by running `mise ls node`.
+node@24.0.0, first make sure that mise has this version installed and active by running `mise ls node`.
 It should not say missing and have the correct "Requested" version:
 
 ```bash
 $ mise ls node
 Plugin  Version  Config Source       Requested
-node    22.0.0  ~/.mise/config.toml  22.0.0
+node    24.0.0  ~/.mise/config.toml  24.0.0
 ```
 
 If `node -v` isn't showing the right version, make sure mise is activated by running `mise doctor`.
@@ -179,5 +179,6 @@ If you are expecting mise to automatically install a tool when you run a command
 This is because mise does not have a way of knowing which binaries a tool provides unless there is already an installed (even inactive) version of that tool. If you have never installed any version of a tool, mise cannot determine which tool is responsible for a given binary name, and so it cannot auto-install it on demand.
 
 **Workarounds:**
+
 - Manually install at least one version of the tool you want to be auto-installed in the future. After that, the auto-install feature will work for missing versions of that tool.
 - Use [`mise x|exec`](/cli/exec) or [`mise r|run`](/cli/run) to trigger auto-install for missing tools, even if no version is currently installed. These commands will attempt to install the required tool versions automatically.

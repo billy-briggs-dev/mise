@@ -3,7 +3,7 @@
 The following demo shows:
 
 - how to use `mise exec` to run a command with a specific version of a tool
-- how you can use `mise` to install and many other tools such as `jq`, `terraform`, or `go`.
+- how you can use `mise` to install many other tools such as `jq`, `terraform`, or `go`.
 - how to use `mise` to manage multiple versions of `node` on the same system.
 
 <video style="max-width: 100%; height: auto;" controls="controls" src="./tapes/demo.mp4" />
@@ -13,9 +13,9 @@ The following demo shows:
 `mise exec <tool> -- <command>` allows you to run any tools with mise
 
 ```shell
-mise exec node@22 -- node -v
-# mise node@22.14.0 ✓ installed
-# v22.14.0
+mise exec node@24 -- node -v
+# mise node@24.x.x ✓ installed
+# v24.x.x
 ```
 
 node is only available in the mise environment, not globally

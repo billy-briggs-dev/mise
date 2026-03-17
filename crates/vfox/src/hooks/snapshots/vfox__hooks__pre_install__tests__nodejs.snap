@@ -1,17 +1,18 @@
 ---
-source: src/hooks/pre_install.rs
+source: crates/vfox/src/hooks/pre_install.rs
 expression: pre_install
 ---
 PreInstall {
     version: "20.0.0",
     url: Some(
-        "https://nodejs.org/dist/v20.0.0/node-v20.0.0-linux-x64.tar.gz",
+        "file:///fake/nodejs/node-v20.0.0.tar.gz",
     ),
     note: None,
     sha256: Some(
-        "95439a0a836fc858565c7b6a7b1e55d1741901e6f205485e496abbefe973cfce",
+        "fakehash20.0.0",
     ),
     md5: None,
     sha1: None,
     sha512: None,
+    attestation: None,
 }

@@ -1,5 +1,5 @@
 use crate::path::{Path, PathBuf, PathExt};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::fs;
 use std::fs::File;
@@ -274,6 +274,38 @@ pub fn touch_dir(dir: &Path) -> Result<()> {
         .wrap_err_with(|| format!("failed to touch dir: {}", display_path(dir)))
 }
 
+/// Synchronizes a directory to disk, ensuring that filesystem metadata changes
+/// (such as file creations or deletions) are persisted.
+///
+/// This is important after operations like removing files to ensure the changes
+/// are immediately visible to other processes, e.g. to avoid race conditions.
+///
+/// # Platform-specific behavior
+///
+/// - **Unix/Linux**: Performs an fsync on the directory file descriptor, which
+///   ensures directory metadata (like file listings) is written to disk.
+/// - **Windows**: Not implemented (no-op).
+///
+/// # Errors
+///
+/// On Unix systems, returns an error if the directory cannot be opened or synced.
+/// On Windows, always succeeds.
+#[cfg(unix)]
+pub fn sync_dir<P: AsRef<Path>>(path: P) -> Result<()> {
+    let path = path.as_ref();
+    trace!("sync {}", display_path(path));
+    let dir = File::open(path)
+        .wrap_err_with(|| format!("failed to open dir for sync: {}", display_path(path)))?;
+    dir.sync_all()
+        .wrap_err_with(|| format!("failed to sync dir: {}", display_path(path)))
+}
+
+#[cfg(windows)]
+pub fn sync_dir<P: AsRef<Path>>(_path: P) -> Result<()> {
+    // Not implemented on Windows
+    Ok(())
+}
+
 pub fn modified_duration(path: &Path) -> Result<Duration> {
     let metadata = path.metadata()?;
     let modified = metadata.modified()?;
@@ -442,6 +474,14 @@ pub fn is_executable(path: &Path) -> bool {
 
 #[cfg(windows)]
 pub fn is_executable(path: &Path) -> bool {
+    if has_known_executable_extension(path) {
+        return true;
+    }
+    has_shebang(path)
+}
+
+#[cfg(windows)]
+pub fn has_known_executable_extension(path: &Path) -> bool {
     path.extension().map_or(
         Settings::get()
             .windows_executable_extensions
@@ -455,6 +495,20 @@ pub fn is_executable(path: &Path) -> bool {
             false
         },
     )
+}
+
+/// Check if a file starts with a shebang (#!).
+/// Only reads the first 2 bytes to minimize I/O during task discovery.
+#[cfg(windows)]
+pub fn has_shebang(path: &Path) -> bool {
+    std::fs::File::open(path)
+        .and_then(|mut f| {
+            use std::io::Read;
+            let mut buf = [0u8; 2];
+            f.read_exact(&mut buf)?;
+            Ok(buf == *b"#!")
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -489,15 +543,34 @@ pub async fn make_executable_async<P: AsRef<Path>>(_path: P) -> Result<()> {
     Ok(())
 }
 
-pub fn all_dirs() -> Result<Vec<PathBuf>> {
-    let mut output = vec![];
-    let dir = env::current_dir().ok();
-    let mut cwd = dir.as_deref();
-    while let Some(dir) = cwd {
-        output.push(dir.to_path_buf());
-        cwd = dir.parent();
-    }
-    Ok(output)
+pub fn all_dirs<P: AsRef<Path>>(
+    start_dir: P,
+    ceiling_dirs: &HashSet<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    trace!(
+        "file::all_dirs Collecting all ancestors of {} until ceiling {:?}",
+        display_path(&start_dir),
+        ceiling_dirs
+    );
+    Ok(start_dir
+        .as_ref()
+        .ancestors()
+        .map_while(|p| {
+            if ceiling_dirs.contains(p) {
+                debug!(
+                    "file::all_dirs Reached ceiling directory: {}",
+                    display_path(p)
+                );
+                None
+            } else {
+                trace!(
+                    "file::all_dirs Adding ancestor directory: {}",
+                    display_path(p)
+                );
+                Some(p.to_path_buf())
+            }
+        })
+        .collect())
 }
 
 fn is_empty_dir(path: &Path) -> Result<bool> {
@@ -583,6 +656,19 @@ pub fn which_non_pristine<P: AsRef<Path>>(name: P) -> Option<PathBuf> {
     _which(name, &env::PATH_NON_PRISTINE)
 }
 
+/// returns the first executable in PATH, excluding the mise shim directory
+/// use this for internal tool lookups to avoid recursive shim invocations
+/// (shims call `mise exec`, which would re-enter the same code path)
+pub fn which_no_shims<P: AsRef<Path>>(name: P) -> Option<PathBuf> {
+    let shim_dir = &*dirs::SHIMS;
+    let paths: Vec<PathBuf> = env::PATH_NON_PRISTINE
+        .iter()
+        .filter(|p| p.as_path() != *shim_dir)
+        .cloned()
+        .collect();
+    _which(name, &paths)
+}
+
 fn _which<P: AsRef<Path>>(name: P, paths: &[PathBuf]) -> Option<PathBuf> {
     let name = name.as_ref();
     paths.iter().find_map(|path| {
@@ -631,19 +717,27 @@ pub fn un_bz2(input: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default, Clone, Copy, PartialEq, strum::EnumString, strum::Display)]
+#[derive(Debug, Clone, Copy, PartialEq, strum::EnumString, strum::Display)]
 pub enum TarFormat {
-    #[default]
-    Auto,
-    #[strum(serialize = "tar.gz")]
+    #[strum(serialize = "tar.gz", serialize = "tgz")]
     TarGz,
-    #[strum(serialize = "tar.xz")]
+    #[strum(serialize = "gz")]
+    Gz,
+    #[strum(serialize = "tar.xz", serialize = "txz")]
     TarXz,
-    #[strum(serialize = "tar.bz2")]
+    #[strum(serialize = "xz")]
+    Xz,
+    #[strum(serialize = "tar.bz2", serialize = "tbz2")]
     TarBz2,
-    #[strum(serialize = "tar.zst")]
+    #[strum(serialize = "bz2")]
+    Bz2,
+    #[strum(serialize = "tar.zst", serialize = "tzst")]
     TarZst,
-    #[strum(serialize = "zip")]
+    #[strum(serialize = "zst")]
+    Zst,
+    #[strum(serialize = "tar")]
+    Tar,
+    #[strum(serialize = "zip", serialize = "vsix")]
     Zip,
     #[strum(serialize = "7z")]
     SevenZip,
@@ -652,38 +746,82 @@ pub enum TarFormat {
 }
 
 impl TarFormat {
+    pub fn from_file_name(filename: &str) -> Self {
+        let filename = filename.to_lowercase();
+
+        if let Some(idx) = filename.rfind(".tar.") {
+            let ext = &filename[idx + 1..];
+            let fmt = Self::from_ext(ext);
+            if fmt != TarFormat::Raw {
+                return fmt;
+            }
+        }
+
+        if let Some(ext) = Path::new(&filename).extension().and_then(|s| s.to_str()) {
+            Self::from_ext(ext)
+        } else {
+            TarFormat::Raw
+        }
+    }
+
     pub fn from_ext(ext: &str) -> Self {
-        match ext {
-            "gz" | "tgz" => TarFormat::TarGz,
-            "xz" | "txz" => TarFormat::TarXz,
-            "bz2" | "tbz2" => TarFormat::TarBz2,
-            "zst" | "tzst" => TarFormat::TarZst,
-            "zip" => TarFormat::Zip,
-            "7z" => TarFormat::SevenZip,
-            _ => TarFormat::Raw,
+        ext.to_lowercase().parse().unwrap_or(TarFormat::Raw)
+    }
+
+    pub fn is_archive(&self) -> bool {
+        match self {
+            TarFormat::TarGz
+            | TarFormat::TarXz
+            | TarFormat::TarBz2
+            | TarFormat::TarZst
+            | TarFormat::Tar
+            | TarFormat::Zip
+            | TarFormat::SevenZip => true,
+            TarFormat::Gz | TarFormat::Xz | TarFormat::Bz2 | TarFormat::Zst | TarFormat::Raw => {
+                false
+            }
+        }
+    }
+
+    pub fn extension(&self) -> Option<&'static str> {
+        match self {
+            TarFormat::TarGz => Some("tar.gz"),
+            TarFormat::Gz => Some("gz"),
+            TarFormat::TarXz => Some("tar.xz"),
+            TarFormat::Xz => Some("xz"),
+            TarFormat::TarBz2 => Some("tar.bz2"),
+            TarFormat::Bz2 => Some("bz2"),
+            TarFormat::TarZst => Some("tar.zst"),
+            TarFormat::Zst => Some("zst"),
+            TarFormat::Tar => Some("tar"),
+            TarFormat::Zip => Some("zip"),
+            TarFormat::SevenZip => Some("7z"),
+            TarFormat::Raw => None,
         }
     }
 }
 
-#[derive(Default)]
 pub struct TarOptions<'a> {
     pub format: TarFormat,
     pub strip_components: usize,
-    pub pr: Option<&'a Box<dyn SingleReport>>,
+    pub pr: Option<&'a dyn SingleReport>,
+    /// When false, files will be extracted with current timestamp instead of archive's mtime
+    pub preserve_mtime: bool,
+}
+
+impl<'a> TarOptions<'a> {
+    pub fn new(format: TarFormat) -> Self {
+        Self {
+            format,
+            strip_components: 0,
+            pr: None,
+            preserve_mtime: true,
+        }
+    }
 }
 
 pub fn untar(archive: &Path, dest: &Path, opts: &TarOptions) -> Result<()> {
-    let format = match opts.format {
-        TarFormat::Auto => {
-            // Handle missing extension gracefully, default to Raw (which will be treated as tar.gz)
-            match archive.extension() {
-                Some(ext) => TarFormat::from_ext(&ext.to_string_lossy()),
-                None => TarFormat::Raw,
-            }
-        }
-        _ => opts.format,
-    };
-    if format == TarFormat::Zip {
+    if opts.format == TarFormat::Zip {
         return unzip(
             archive,
             dest,
@@ -691,7 +829,7 @@ pub fn untar(archive: &Path, dest: &Path, opts: &TarOptions) -> Result<()> {
                 strip_components: opts.strip_components,
             },
         );
-    } else if format == TarFormat::SevenZip {
+    } else if opts.format == TarFormat::SevenZip {
         #[cfg(windows)]
         return un7z(
             archive,
@@ -709,12 +847,36 @@ pub fn untar(archive: &Path, dest: &Path, opts: &TarOptions) -> Result<()> {
             archive.file_name().unwrap().to_string_lossy()
         ));
     }
-    let tar = open_tar(format, archive)?;
+
     let err = || {
         let archive = display_path(archive);
         let dest = display_path(dest);
         format!("failed to extract tar: {archive} to {dest}")
     };
+
+    let format = opts.format;
+    if !format.is_archive() && format != TarFormat::Raw {
+        let mut reader = open_tar(format, archive)?;
+        // If dest is a directory, join with the archive filename (minus extension)
+        // If dest is not a dir, assume it's the target file path
+        let out_path = if dest.is_dir() {
+            let name = archive
+                .file_stem()
+                .unwrap_or_else(|| archive.file_name().unwrap());
+            dest.join(name)
+        } else {
+            dest.to_path_buf()
+        };
+
+        if let Some(parent) = out_path.parent() {
+            create_dir_all(parent).wrap_err_with(err)?;
+        }
+        let mut out = File::create(&out_path).wrap_err_with(err)?;
+        std::io::copy(&mut reader, &mut out).wrap_err_with(err)?;
+        return Ok(());
+    }
+
+    let tar = open_tar(format, archive)?;
     // TODO: put this back in when we can read+write in parallel
     // let mut cur = Cursor::new(vec![]);
     // let mut total = 0;
@@ -731,17 +893,66 @@ pub fn untar(archive: &Path, dest: &Path, opts: &TarOptions) -> Result<()> {
     //     }
     // }
     create_dir_all(dest).wrap_err_with(err)?;
+
+    // Try to extract using the tar crate, detecting sparse files during extraction
+    let mut needs_system_tar = false;
     for entry in Archive::new(tar).entries().wrap_err_with(err)? {
         let mut entry = entry.wrap_err_with(err)?;
+
+        // Check if this is a GNU sparse file
+        if entry.header().entry_type().is_gnu_sparse() {
+            debug!("Detected GNU sparse file, falling back to system tar");
+            needs_system_tar = true;
+            // Clean up any partial extraction
+            remove_all(dest)?;
+            create_dir_all(dest)?;
+            break;
+        }
+
+        // Configure mtime preservation based on options
+        entry.set_preserve_mtime(opts.preserve_mtime);
+
         trace!("extracting {}", entry.path().wrap_err_with(err)?.display());
         entry.unpack_in(dest).wrap_err_with(err)?;
-        if let Some(pr) = &opts.pr {
-            pr.set_length(entry.raw_file_position());
+    }
+
+    // Check for the GNUSparseFile.0 directory which indicates the tar crate
+    // incorrectly handled a sparse file
+    if !needs_system_tar {
+        let sparse_dir = dest.join("GNUSparseFile.0");
+        if sparse_dir.exists() && sparse_dir.is_dir() {
+            debug!("Found GNUSparseFile.0 directory, using system tar");
+            needs_system_tar = true;
+            // Clean up the bad extraction
+            remove_all(dest)?;
+            create_dir_all(dest)?;
         }
     }
-    // if let Some(pr) = &opts.pr {
-    //     pr.set_position(total);
-    // }
+
+    if needs_system_tar {
+        // Use system tar for archives with problematic sparse files
+        // The tar crate doesn't properly handle certain GNU sparse formats
+        debug!("Using system tar for: {}", archive.display());
+
+        // When preserve_mtime is false, use -m flag to not restore modification times
+        // This causes extracted files to have current time, which is important for
+        // cache invalidation and autopruning. Works on both BSD and GNU tar.
+        if !opts.preserve_mtime {
+            cmd!("tar", "-mxf", archive, "-C", dest)
+                .run()
+                .wrap_err_with(|| {
+                    format!("Failed to extract {} using system tar", archive.display())
+                })?;
+        } else {
+            cmd!("tar", "-xf", archive, "-C", dest)
+                .run()
+                .wrap_err_with(|| {
+                    format!("Failed to extract {} using system tar", archive.display())
+                })?;
+        }
+    }
+
+    // Always use our manual strip to ensure consistent behavior across backends
     strip_archive_path_components(dest, opts.strip_components).wrap_err_with(err)?;
     Ok(())
 }
@@ -750,19 +961,13 @@ fn open_tar(format: TarFormat, archive: &Path) -> Result<Box<dyn std::io::Read>>
     let f = File::open(archive)?;
     Ok(match format {
         // TODO: we probably shouldn't assume raw is tar.gz, but this was to retain existing behavior
-        TarFormat::TarGz | TarFormat::Raw => Box::new(GzDecoder::new(f)),
-        TarFormat::TarXz => Box::new(xz2::read::XzDecoder::new(f)),
-        TarFormat::TarBz2 => Box::new(BzDecoder::new(f)),
-        TarFormat::TarZst => Box::new(zstd::stream::read::Decoder::new(f)?),
+        TarFormat::TarGz | TarFormat::Gz | TarFormat::Raw => Box::new(GzDecoder::new(f)),
+        TarFormat::TarXz | TarFormat::Xz => Box::new(xz2::read::XzDecoder::new(f)),
+        TarFormat::TarBz2 | TarFormat::Bz2 => Box::new(BzDecoder::new(f)),
+        TarFormat::TarZst | TarFormat::Zst => Box::new(zstd::stream::read::Decoder::new(f)?),
+        TarFormat::Tar => Box::new(f),
         TarFormat::Zip => bail!("zip format not supported"),
         TarFormat::SevenZip => bail!("7z format not supported"),
-        TarFormat::Auto => match archive.extension().and_then(|s| s.to_str()) {
-            Some("xz") => open_tar(TarFormat::TarXz, archive)?,
-            Some("bz2") => open_tar(TarFormat::TarBz2, archive)?,
-            Some("zst") => open_tar(TarFormat::TarZst, archive)?,
-            Some("zip") => bail!("zip format not supported"),
-            _ => open_tar(TarFormat::TarGz, archive)?,
-        },
     })
 }
 
@@ -775,22 +980,29 @@ fn strip_archive_path_components(dir: &Path, strip_depth: usize) -> Result<()> {
     }
 
     let top_level_paths = ls(dir)?;
-    let entries: Vec<PathBuf> = top_level_paths
-        .iter()
-        .map(|p| ls(p))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    for entry in entries {
-        let mut new_dir = dir.to_path_buf();
-        new_dir.push(entry.file_name().unwrap());
-        fs::rename(entry, new_dir)?;
-    }
+
     for path in top_level_paths {
-        if path.symlink_metadata()?.is_dir() {
-            remove_dir(path)?;
+        if !path.symlink_metadata()?.is_dir() {
+            continue;
         }
+
+        // rename the directory to a temp name to avoid conflicts when moving files
+        let temp_path = path.with_file_name(format!(
+            "{}_tmp_strip",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        fs::rename(&path, &temp_path)?;
+
+        for entry in ls(&temp_path)? {
+            if let Some(file_name) = entry.file_name() {
+                let dest_path = dir.join(file_name);
+                fs::rename(entry, dest_path)?;
+            } else {
+                continue;
+            }
+        }
+
+        remove_dir(temp_path)?;
     }
     Ok(())
 }
@@ -880,12 +1092,12 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 pub fn desymlink_path(p: &Path) -> PathBuf {
-    if p.is_symlink() {
-        if let Ok(target) = fs::read_link(p) {
-            return target
-                .canonicalize()
-                .unwrap_or_else(|_| target.to_path_buf());
-        }
+    if p.is_symlink()
+        && let Ok(target) = fs::read_link(p)
+    {
+        return target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
     }
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
@@ -902,6 +1114,13 @@ pub fn clone_dir(from: &PathBuf, to: &PathBuf) -> Result<()> {
 }
 
 /// Inspects the top-level contents of a tar archive without extracting it
+/// Skips leading CurDir (".") components from a path's components iterator.
+/// Archives often have paths like "./foo/bar" where the leading "." should be ignored.
+fn skip_curdir_components(path: &Path) -> impl Iterator<Item = std::path::Component<'_>> {
+    path.components()
+        .skip_while(|c| matches!(c, std::path::Component::CurDir))
+}
+
 pub fn inspect_tar_contents(archive: &Path, format: TarFormat) -> Result<Vec<(String, bool)>> {
     let tar = open_tar(format, archive)?;
     let mut archive = Archive::new(tar);
@@ -912,12 +1131,15 @@ pub fn inspect_tar_contents(archive: &Path, format: TarFormat) -> Result<Vec<(St
         let path = entry.path()?;
         let header = entry.header();
 
-        // Get the first component of the path (top-level directory/file)
-        if let Some(first_component) = path.components().next() {
+        // Get the first non-CurDir component of the path (top-level directory/file)
+        let mut components = skip_curdir_components(&path);
+
+        if let Some(first_component) = components.next() {
             let name = first_component.as_os_str().to_string_lossy().to_string();
 
             // Check if this entry indicates the component is a directory
-            let is_directory = header.entry_type().is_dir() || path.components().count() > 1; // If there are nested components, it's a directory
+            // It's a directory if the entry type is dir OR if there are more components after the first
+            let is_directory = header.entry_type().is_dir() || components.next().is_some();
 
             // Update the component's directory status
             // A component is a directory if ANY entry indicates it's a directory
@@ -939,11 +1161,15 @@ pub fn inspect_zip_contents(archive: &Path) -> Result<Vec<(String, bool)>> {
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
         if let Some(path) = file.enclosed_name() {
-            if let Some(first_component) = path.components().next() {
+            // Get the first non-CurDir component of the path (top-level directory/file)
+            let mut components = skip_curdir_components(&path);
+
+            if let Some(first_component) = components.next() {
                 let name = first_component.as_os_str().to_string_lossy().to_string();
 
                 // Check if this entry indicates the component is a directory
-                let is_directory = file.is_dir() || path.components().count() > 1; // If there are nested components, it's a directory
+                // It's a directory if the entry type is dir OR if there are more components after the first
+                let is_directory = file.is_dir() || components.next().is_some();
 
                 let existing = top_level_components.entry(name.clone()).or_insert(false);
                 *existing = *existing || is_directory;
@@ -963,9 +1189,13 @@ pub fn inspect_7z_contents(archive: &Path) -> Result<Vec<(String, bool)>> {
     for file in &sevenz.archive().files {
         let path = PathBuf::from(file.name());
 
-        if let Some(first_component) = path.components().next() {
+        // Get the first non-CurDir component of the path (top-level directory/file)
+        let mut components = skip_curdir_components(&path);
+
+        if let Some(first_component) = components.next() {
             let name = first_component.as_os_str().to_string_lossy().to_string();
-            let is_directory = file.is_directory() || path.components().count() > 1;
+            // It's a directory if the entry type is dir OR if there are more components after the first
+            let is_directory = file.is_directory() || components.next().is_some();
 
             let existing = top_level_components.entry(name.clone()).or_insert(false);
             *existing = *existing || is_directory;
@@ -1100,5 +1330,241 @@ mod tests {
         // This simulates what would happen if inspect_tar_contents returned this
         let should_strip = result.len() == 1 && result[0].1;
         assert!(should_strip);
+    }
+
+    #[test]
+    fn test_inspect_tar_contents_curdir_prefix() {
+        // Test that archives with "./" prefixed paths are handled correctly
+        // This reproduces the bug from https://github.com/jdx/mise/discussions/7862
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use tar::Builder;
+        use tempfile::NamedTempFile;
+
+        // Create a temp tar.gz with "./" prefixed paths (like unison's archive)
+        let temp_file = NamedTempFile::new().unwrap();
+        let gz = GzEncoder::new(temp_file.as_file(), Compression::default());
+        let mut builder = Builder::new(gz);
+
+        // Add entries with "./" prefix - simulating archive structure like:
+        // ./dir1/file1
+        // ./dir2/file2
+        // ./standalone
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+
+        // Add ./dir1/file1
+        builder
+            .append_data(&mut header.clone(), "./dir1/file1", std::io::empty())
+            .unwrap();
+
+        // Add ./dir2/file2
+        builder
+            .append_data(&mut header.clone(), "./dir2/file2", std::io::empty())
+            .unwrap();
+
+        // Add ./standalone (file at root with ./ prefix)
+        builder
+            .append_data(&mut header.clone(), "./standalone", std::io::empty())
+            .unwrap();
+
+        let gz = builder.into_inner().unwrap();
+        gz.finish().unwrap();
+
+        // Now test inspect_tar_contents
+        let result = inspect_tar_contents(temp_file.path(), TarFormat::TarGz).unwrap();
+
+        // Should have 3 top-level entries: dir1, dir2, standalone
+        // NOT a single "." entry
+        assert_eq!(
+            result.len(),
+            3,
+            "Expected 3 top-level entries, got: {:?}",
+            result
+        );
+
+        let names: std::collections::HashSet<_> = result.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains("dir1"), "Should contain dir1");
+        assert!(names.contains("dir2"), "Should contain dir2");
+        assert!(names.contains("standalone"), "Should contain standalone");
+        assert!(!names.contains("."), "Should NOT contain '.' (CurDir)");
+
+        // dir1 and dir2 should be marked as directories (have nested content)
+        for (name, is_dir) in &result {
+            if name == "dir1" || name == "dir2" {
+                assert!(*is_dir, "{} should be marked as directory", name);
+            } else if name == "standalone" {
+                assert!(!*is_dir, "standalone should NOT be marked as directory");
+            }
+        }
+
+        // Verify should_strip_components returns false (multiple top-level entries)
+        let should_strip = should_strip_components(temp_file.path(), TarFormat::TarGz).unwrap();
+        assert!(
+            !should_strip,
+            "Should NOT strip components for multi-entry archive"
+        );
+    }
+
+    #[test]
+    fn test_all_dirs_no_ceiling() {
+        let start_dir = Path::new("/a/b/c");
+        let ceiling_dirs = HashSet::new();
+
+        let result = all_dirs(start_dir, &ceiling_dirs).unwrap();
+
+        assert_eq!(result.len(), 4);
+        assert!(result.contains(&PathBuf::from("/a/b/c")));
+        assert!(result.contains(&PathBuf::from("/a/b")));
+        assert!(result.contains(&PathBuf::from("/a")));
+        assert!(result.contains(&PathBuf::from("/")));
+    }
+
+    #[test]
+    fn test_all_dirs_with_ceiling() {
+        let start_dir = Path::new("/a/b/c");
+        let mut ceiling_dirs = HashSet::new();
+        ceiling_dirs.insert(PathBuf::from("/a"));
+
+        let result = all_dirs(start_dir, &ceiling_dirs).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&PathBuf::from("/a/b/c")));
+        assert!(result.contains(&PathBuf::from("/a/b")));
+        assert!(!result.contains(&PathBuf::from("/a")));
+        assert!(!result.contains(&PathBuf::from("/")));
+    }
+
+    #[test]
+    fn test_all_dirs_with_ceiling_at_start() {
+        let start_dir = Path::new("/a/b/c");
+        let mut ceiling_dirs = HashSet::new();
+        ceiling_dirs.insert(PathBuf::from("/a/b/c"));
+
+        let result = all_dirs(start_dir, &ceiling_dirs).unwrap();
+
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_all_dirs_with_multiple_ceilings() {
+        let start_dir = Path::new("/a/b/c/d/e");
+        let mut ceiling_dirs = HashSet::new();
+        ceiling_dirs.insert(PathBuf::from("/a/b"));
+        ceiling_dirs.insert(PathBuf::from("/a/b/c/d"));
+
+        let result = all_dirs(start_dir, &ceiling_dirs).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&PathBuf::from("/a/b/c/d/e")));
+    }
+
+    #[test]
+    fn test_all_dirs_with_relative_path() {
+        let start_dir = Path::new("a/b/c");
+        let ceiling_dirs = HashSet::new();
+
+        let result = all_dirs(start_dir, &ceiling_dirs).unwrap();
+
+        assert!(result.contains(&PathBuf::from("a/b/c")));
+        assert!(result.contains(&PathBuf::from("a/b")));
+        assert!(result.contains(&PathBuf::from("a")));
+    }
+
+    #[test]
+    fn test_tar_format_from_file_name() {
+        assert_eq!(TarFormat::from_file_name("foo.tar.gz"), TarFormat::TarGz);
+        assert_eq!(TarFormat::from_file_name("foo.tgz"), TarFormat::TarGz);
+        assert_eq!(TarFormat::from_file_name("foo.tar.xz"), TarFormat::TarXz);
+        assert_eq!(TarFormat::from_file_name("foo.txz"), TarFormat::TarXz);
+        assert_eq!(TarFormat::from_file_name("foo.tar.bz2"), TarFormat::TarBz2);
+        assert_eq!(TarFormat::from_file_name("foo.tbz2"), TarFormat::TarBz2);
+        assert_eq!(TarFormat::from_file_name("foo.tar.zst"), TarFormat::TarZst);
+        assert_eq!(TarFormat::from_file_name("foo.tzst"), TarFormat::TarZst);
+        assert_eq!(TarFormat::from_file_name("foo.tar"), TarFormat::Tar);
+        assert_eq!(TarFormat::from_file_name("foo.zip"), TarFormat::Zip);
+        assert_eq!(TarFormat::from_file_name("foo.vsix"), TarFormat::Zip);
+        assert_eq!(TarFormat::from_file_name("foo.7z"), TarFormat::SevenZip);
+        assert_eq!(TarFormat::from_file_name("foo.gz"), TarFormat::Gz);
+        assert_eq!(TarFormat::from_file_name("foo.xz"), TarFormat::Xz);
+        assert_eq!(TarFormat::from_file_name("foo.bz2"), TarFormat::Bz2);
+        assert_eq!(TarFormat::from_file_name("foo.zst"), TarFormat::Zst);
+        assert_eq!(TarFormat::from_file_name("foo"), TarFormat::Raw);
+        assert_eq!(TarFormat::from_file_name("foo.txt"), TarFormat::Raw);
+    }
+
+    #[test]
+    fn test_untar_single_file() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("test.gz");
+        let dest_path = dir.path().join("test-out");
+
+        // Create a dummy gzip file
+        let file = File::create(&src_path).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(b"hello world").unwrap();
+        encoder.finish().unwrap();
+
+        // untar (decompress) it
+        untar(
+            &src_path,
+            &dest_path,
+            &TarOptions {
+                pr: None,
+                ..TarOptions::new(TarFormat::Gz)
+            },
+        )
+        .unwrap();
+
+        // Verify output
+        assert!(dest_path.exists());
+        assert!(dest_path.is_file());
+        let content = std::fs::read_to_string(&dest_path).unwrap();
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn test_untar_single_file_to_dir() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("test_file.gz");
+        let dest_dir = dir.path().join("out_dir");
+        std::fs::create_dir(&dest_dir).unwrap();
+
+        // Create a dummy gzip file
+        let file = File::create(&src_path).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(b"hello world").unwrap();
+        encoder.finish().unwrap();
+
+        // untar (decompress) it
+        untar(
+            &src_path,
+            &dest_dir,
+            &TarOptions {
+                pr: None,
+                ..TarOptions::new(TarFormat::Gz)
+            },
+        )
+        .unwrap();
+
+        // Verify output - should be out_dir/test_file
+        let expected_path = dest_dir.join("test_file");
+        assert!(expected_path.exists());
+        assert!(expected_path.is_file());
+        let content = std::fs::read_to_string(&expected_path).unwrap();
+        assert_eq!(content, "hello world");
     }
 }

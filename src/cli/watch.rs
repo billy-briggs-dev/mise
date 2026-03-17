@@ -1,6 +1,6 @@
 use crate::Result;
+use crate::cli::Cli;
 use crate::cli::args::BackendArg;
-use crate::cli::{Cli, run};
 use crate::cmd;
 use crate::config::Config;
 use crate::env;
@@ -18,6 +18,9 @@ use std::path::PathBuf;
 ///
 /// This command uses the `watchexec` tool to watch for changes to files and rerun the specified task(s).
 /// It must be installed for this command to work, but you can install it with `mise use -g watchexec@latest`.
+///
+/// For more advanced process management (daemon management, auto-restart, readiness checks,
+/// cron scheduling), see mise's sister project: https://pitchfork.jdx.dev
 #[derive(Debug, clap::Args)]
 #[clap(visible_alias = "w", verbatim_doc_comment, after_long_help = AFTER_LONG_HELP)]
 pub struct Watch {
@@ -36,9 +39,13 @@ pub struct Watch {
     args: Vec<String>,
 
     /// Files to watch
-    /// Defaults to sources from the tasks(s)
+    /// Defaults to sources from the task(s)
     #[clap(short, long, verbatim_doc_comment, hide = true)]
     glob: Vec<String>,
+
+    /// Run only the specified tasks skipping all dependencies
+    #[clap(long, verbatim_doc_comment)]
+    pub skip_deps: bool,
 
     #[clap(flatten)]
     watchexec: WatchexecArgs,
@@ -75,7 +82,7 @@ impl Watch {
         if args.is_empty() {
             bail!("No tasks specified");
         }
-        let tasks = run::get_task_lists(&config, &args, false).await?;
+        let tasks = crate::task::task_list::get_task_lists(&config, &args, false, false).await?;
         let mut args = vec![];
         if let Some(delay_run) = self.watchexec.delay_run {
             args.push("--delay-run".to_string());
@@ -189,6 +196,9 @@ impl Watch {
             env::MISE_BIN.to_string_lossy().to_string(),
             "run".to_string(),
         ]);
+        if self.skip_deps {
+            args.push("--skip-deps".to_string());
+        }
         let task_args = itertools::intersperse(
             tasks.iter().map(|t| {
                 let mut args = vec![t.name.to_string()];
@@ -207,7 +217,25 @@ impl Watch {
         for (k, v) in ts.env_with_path(&config).await? {
             cmd = cmd.env(k, v);
         }
-        cmd.run()?;
+
+        // Save terminal state before running watchexec, because --clear=reset
+        // sends a full terminal reset (RIS) which can corrupt terminal settings
+        // (e.g. disabling echo) if watchexec is interrupted with Ctrl+C.
+        #[cfg(unix)]
+        let saved_termios = nix::sys::termios::tcgetattr(std::io::stdin()).ok();
+
+        let result = cmd.run();
+
+        #[cfg(unix)]
+        if let Some(termios) = saved_termios {
+            let _ = nix::sys::termios::tcsetattr(
+                std::io::stdin(),
+                nix::sys::termios::SetArg::TCSANOW,
+                &termios,
+            );
+        }
+
+        result?;
         Ok(())
     }
 
@@ -1083,7 +1111,7 @@ pub struct WatchexecArgs {
     // #[clap(short = 'C', long, value_hint = ValueHint::DirPath, long)]
     // pub cd: Option<PathBuf>,
     //
-    // /// Don't actually run the tasks(s), just print them in order of execution
+    // /// Don't actually run the task(s), just print them in order of execution
     // #[clap(long, short = 'n', verbatim_doc_comment)]
     // pub dry_run: bool,
     //
@@ -1093,13 +1121,13 @@ pub struct WatchexecArgs {
     //
     // /// Print stdout/stderr by line, prefixed with the tasks's label
     // /// Defaults to true if --jobs > 1
-    // /// Configure with `task_output` config or `MISE_TASK_OUTPUT` env var
+    // /// Configure with `task.output` config or `MISE_TASK_OUTPUT` env var
     // #[clap(long, short, verbatim_doc_comment, overrides_with = "interleave")]
     // pub prefix: bool,
     //
     // /// Print directly to stdout/stderr instead of by line
     // /// Defaults to true if --jobs == 1
-    // /// Configure with `task_output` config or `MISE_TASK_OUTPUT` env var
+    // /// Configure with `task.output` config or `MISE_TASK_OUTPUT` env var
     // #[clap(long, short, verbatim_doc_comment, overrides_with = "prefix")]
     // pub interleave: bool,
     //
@@ -1167,12 +1195,13 @@ pub enum FsEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "lower")]
 pub enum ShellCompletion {
     Bash,
     Elvish,
     Fish,
     Nu,
-    Powershell,
+    PowerShell,
     Zsh,
 }
 

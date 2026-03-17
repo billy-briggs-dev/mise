@@ -1,17 +1,32 @@
 <div align="center">
-<h1><a href="https://mise.jdx.dev">
-  <img src="https://github.com/jdx/mise/assets/216188/27a8ea18-9383-4d86-a445-305b9a6248c1" alt="mise-logo" width="400" /><br />
-  mise-en-place
-</a></h1>
-<!-- <a href="https://mise.jdx.dev"><picture> -->
-<!--   <source media="(prefers-color-scheme: dark)" width="617" srcset="./docs/logo-dark@2x.png"> -->
-<!--   <img alt="mise logo" width="617" src="./docs/logo-light@2x.png"> -->
-<!-- </picture></a> -->
-<a href="https://crates.io/crates/mise"><img alt="Crates.io" src="https://img.shields.io/crates/v/mise?style=for-the-badge"></a>
-<a href="https://github.com/jdx/mise/blob/main/LICENSE"><img alt="GitHub" src="https://img.shields.io/github/license/jdx/mise?color=%2344CC11&style=for-the-badge"></a>
-<a href="https://github.com/jdx/mise/actions/workflows/test.yml"><img alt="GitHub Workflow Status" src="https://img.shields.io/github/actions/workflow/status/jdx/mise/test.yml?style=for-the-badge"></a>
-<a href="https://discord.gg/mABnUDvP57"><img alt="Discord" src="https://img.shields.io/discord/1066429325269794907?color=%23738ADB&style=for-the-badge"></a>
-<p><em>The front-end to your dev env.</em></p>
+
+<h1 align="center">
+  <a href="https://mise.jdx.dev">
+    <img src="docs/public/logo.svg" alt="mise" width="256" height="256" />
+    <br>
+    mise-en-place
+  </a>
+</h1>
+
+<p>
+  <a href="https://crates.io/crates/mise"><img alt="Crates.io" src="https://img.shields.io/crates/v/mise?style=for-the-badge&color=8B2252"></a>
+  <a href="https://github.com/jdx/mise/blob/main/LICENSE"><img alt="GitHub" src="https://img.shields.io/github/license/jdx/mise?style=for-the-badge&color=6B7F4E"></a>
+  <a href="https://github.com/jdx/mise/actions/workflows/test.yml"><img alt="GitHub Workflow Status" src="https://img.shields.io/github/actions/workflow/status/jdx/mise/test.yml?style=for-the-badge&color=C5975B"></a>
+  <a href="https://discord.gg/mABnUDvP57"><img alt="Discord" src="https://img.shields.io/discord/1066429325269794907?style=for-the-badge&color=8B2252"></a>
+</p>
+
+<p><b>The front-end to your dev env</b></p>
+
+<p align="center">
+  <a href="https://mise.jdx.dev/getting-started.html">Getting Started</a> •
+  <a href="https://mise.jdx.dev">Documentation</a> •
+  <a href="https://mise.jdx.dev/dev-tools/">Dev Tools</a> •
+  <a href="https://mise.jdx.dev/environments/">Environments</a> •
+  <a href="https://mise.jdx.dev/tasks/">Tasks</a>
+</p>
+
+<hr />
+
 </div>
 
 ## What is it?
@@ -40,7 +55,13 @@ See [Getting started](https://mise.jdx.dev/getting-started.html) for more option
 ```sh-session
 $ curl https://mise.run | sh
 $ ~/.local/bin/mise --version
-2025.8.13 macos-arm64 (a1b2d3e 2025-08-18)
+              _                                        __
+   ____ ___  (_)_______        ___  ____        ____  / /___ _________
+  / __ `__ \/ / ___/ _ \______/ _ \/ __ \______/ __ \/ / __ `/ ___/ _ \
+ / / / / / / (__  )  __/_____/  __/ / / /_____/ /_/ / / /_/ / /__/  __/
+/_/ /_/ /_/_/____/\___/      \___/_/ /_/     / .___/_/\__,_/\___/\___/
+                                            /_/                 by @jdx
+2026.3.9 macos-arm64 (2026-03-13)
 ```
 
 Hook mise into your shell (pick the right one for your shell):
@@ -57,17 +78,17 @@ echo '~/.local/bin/mise activate pwsh | Out-String | Invoke-Expression' >> ~/.co
 ### Execute commands with specific tools
 
 ```sh-session
-$ mise exec node@22 -- node -v
-mise node@22.x.x ✓ installed
-v22.x.x
+$ mise exec node@24 -- node -v
+mise node@24.x.x ✓ installed
+v24.x.x
 ```
 
 ### Install tools
 
 ```sh-session
-$ mise use --global node@22 go@1
+$ mise use --global node@24 go@1
 $ node -v
-v22.x.x
+v24.x.x
 $ go version
 go version go1.x.x macos/arm64
 ```
@@ -154,6 +175,18 @@ Find more examples in the [mise cookbook](https://mise.jdx.dev/mise-cookbook/).
 ## Full Documentation
 
 See [mise.jdx.dev](https://mise.jdx.dev)
+
+## GitHub Issues & Discussions
+
+Due to the volume of issue submissions mise received, using GitHub Issues became unsustainable for
+the project. Instead, mise uses GitHub Discussions which provide a more community-centric platform
+for communication and require less management on the part of the maintainers.
+
+Please note the following discussion categories, which match how issues are often used:
+
+- [Announcements](https://github.com/jdx/mise/discussions/categories/announcements)
+- [Ideas](https://github.com/jdx/mise/discussions/categories/ideas): for feature requests, etc.
+- [Troubleshooting & Bug Reports](https://github.com/jdx/mise/discussions/categories/troubleshooting-and-bug-reports)
 
 ## Special Thanks
 

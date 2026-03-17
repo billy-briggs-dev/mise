@@ -2,7 +2,7 @@
 
 You may install GitLab release assets directly using the `gitlab` backend. This backend downloads release assets from GitLab repositories and is ideal for tools that distribute pre-built binaries through GitLab releases.
 
-The code for this is inside of the mise repository at [`./src/backend/gitlab.rs`](https://github.com/jdx/mise/blob/main/src/backend/gitlab.rs).
+The code for this is inside of the mise repository at [`./src/backend/github.rs`](https://github.com/jdx/mise/blob/main/src/backend/github.rs).
 
 ## Usage
 
@@ -33,7 +33,7 @@ When no `asset_pattern` is specified, mise automatically selects the best asset 
 
 - **OS compatibility** (linux, macos, windows)
 - **Architecture compatibility** (x64, arm64, x86, arm)
-- **Libc variant** (gnu or musl, for Linux)
+- **Libc variant** (gnu or musl for Linux, msvc for Windows)
 - **Archive format preference** (tar.gz, zip, etc.)
 - **Build type** (avoids debug/test builds)
 
@@ -44,7 +44,7 @@ mise install gitlab:user/repo
 ```
 
 ::: tip
-The autodetection logic is implemented in [`src/backend/asset_detector.rs`](https://github.com/jdx/mise/blob/main/src/backend/asset_detector.rs), which is shared by both the GitHub and GitLab backends.
+The autodetection logic is implemented in [`src/backend/asset_matcher.rs`](https://github.com/jdx/mise/blob/main/src/backend/asset_matcher.rs), which is shared by both the GitHub and GitLab backends.
 :::
 
 ### `asset_pattern`
@@ -62,7 +62,8 @@ asset_pattern = "gitlab-runner-linux-x64"
 Specifies a custom version prefix for release tags. By default, mise handles the common `v` prefix (e.g., `v1.0.0`), but some repositories use different prefixes like `release-`, `version-`, or no prefix at all.
 
 When `version_prefix` is configured, mise will:
-- Strip the prefix when listing available versions
+
+- Filter available versions with the prefix and strip it
 - Add the prefix when searching for releases
 - Try both prefixed and non-prefixed versions during installation
 
@@ -72,6 +73,7 @@ When `version_prefix` is configured, mise will:
 ```
 
 **Examples:**
+
 - With `version_prefix = "release-"`:
   - User specifies `1.0.0` → mise searches for `release-1.0.0` tag
   - Available versions show as `1.0.0` (prefix stripped)
@@ -103,7 +105,7 @@ asset_pattern = "tool-1.0.0-x64.tar.gz"
 checksum = "sha256:a1b2c3d4e5f6789..."
 ```
 
-*Instead of specifying the checksum here, you can use [mise.lock](/dev-tools/mise-lock) to manage checksums.*
+_Instead of specifying the checksum here, you can use [mise.lock](/dev-tools/mise-lock) to manage checksums._
 
 ### Platform-specific Checksums
 
@@ -112,8 +114,14 @@ checksum = "sha256:a1b2c3d4e5f6789..."
 version = "latest"
 
 [tools."gitlab:gitlab-org/gitlab-runner".platforms]
-linux-x64 = { asset_pattern = "gitlab-runner-linux-x64", checksum = "sha256:a1b2c3d4e5f6789..." }
-macos-arm64 = { asset_pattern = "gitlab-runner-macos-arm64", checksum = "sha256:b2c3d4e5f6789..." }
+linux-x64 = {
+  asset_pattern = "gitlab-runner-linux-x64",
+  checksum = "sha256:a1b2c3d4e5f6789...",
+}
+macos-arm64 = {
+  asset_pattern = "gitlab-runner-macos-arm64",
+  checksum = "sha256:b2c3d4e5f6789...",
+}
 ```
 
 ### `size`
@@ -151,22 +159,68 @@ Number of directory components to strip when extracting archives:
 If `strip_components` is not explicitly set, mise will automatically detect when to apply `strip_components = 1`. This happens when the extracted archive contains exactly one directory at the root level and no files. This is common with tools like ripgrep that package their binaries in a versioned directory (e.g., `ripgrep-14.1.0-x86_64-unknown-linux-musl/rg`). The auto-detection ensures the binary is placed directly in the install path where mise expects it.
 :::
 
+### `bin`
+
+Rename the downloaded binary to a specific name. This is useful when downloading single binaries that have platform-specific names:
+
+```toml
+[tools."gitlab:myorg/mytool"]
+version = "1.0.0"
+asset_pattern = "mytool-linux-x86_64"
+bin = "mytool"  # Rename from mytool-linux-x86_64 to mytool
+```
+
+::: info
+When downloading single binaries (not archives), mise automatically removes OS/arch suffixes from the filename. For example, `mytool-linux-x86_64` becomes `mytool` automatically. Use the `bin` option only when you need a specific custom name.
+:::
+
+### `rename_exe`
+
+Rename the executable after extraction from an archive. This is useful when the archive contains a binary with a platform-specific name that you want to rename:
+
+```toml
+[tools."gitlab:myorg/mytool"]
+version = "latest"
+asset_pattern = "mytool_linux.zip"
+rename_exe = "mytool"  # Rename the extracted binary to mytool
+```
+
+::: tip
+Use `rename_exe` for archives where the binary inside has a different name than desired. Use `bin` for single binary downloads (non-archives).
+:::
+
 ### `bin_path`
 
-Specify the directory containing binaries within the extracted archive, or where to place the downloaded file. This supports templating with `{name}`, `{version}`, `{os}`, `{arch}`, and `{ext}`:
+Specify the directory containing binaries within the extracted archive, or where to place the downloaded file. This supports Tera templating with variables like `{{ version }}`, `{{ os }}`, `{{ arch }}`, and arch aliases (`{{ darwin_os }}`, `{{ amd64_arch }}`, `{{ x86_64_arch }}`, `{{ gnu_arch }}`):
 
 ```toml
 [tools."gitlab:gitlab-org/gitlab-runner"]
 version = "latest"
-bin_path = "{name}-{version}/bin" # expands to gitlab-runner-1.0.0/bin
+bin_path = "gitlab-runner-{{ version }}/bin" # expands to gitlab-runner-1.0.0/bin
 ```
 
 **Binary path lookup order:**
 
 1. If `bin_path` is specified, use that directory
 2. If `bin_path` is not set, look for a `bin/` directory in the install path
-3. If no `bin/` directory exists, search subdirectories for `bin/` directories
-4. If no `bin/` directories are found, use the root of the extracted directory
+3. If the install path root contains an executable file, use the install path root
+4. If no `bin/` directory exists, search subdirectories for `bin/` directories
+5. If no `bin/` directories are found, searches immediate subdirectories for any executable files. If an executable is found directly within a subdirectory, that entire subdirectory is considered a binary path.
+6. If no executables are found, use the root of the extracted directory
+
+### `filter_bins`
+
+Comma-separated list of binaries to symlink into a filtered `.mise-bins` directory. This is useful when the tool comes with extra binaries that you do not want to expose on PATH.
+
+```toml
+[tools]
+"gitlab:myorg/mytool" = { version = "1.0.0", filter_bins = "mybin" }
+```
+
+When enabled:
+
+- A `.mise-bins` subdirectory is created with symlinks only to the specified binaries
+- Other binaries are not exposed on PATH
 
 ### `api_url`
 
@@ -175,6 +229,14 @@ For self-hosted GitLab instances, specify the API URL:
 ```toml
 [tools]
 "gitlab:myorg/mytool" = { version = "latest", api_url = "https://gitlab.mycompany.com/api/v4" }
+```
+
+## Private GitLab repositories
+
+If you want to install a tool from a private repository on `gitlab.com`, set the `MISE_GITLAB_TOKEN` environment variable for authentication:
+
+```sh
+export MISE_GITLAB_TOKEN="your-token"
 ```
 
 ## Self-hosted GitLab

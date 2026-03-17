@@ -29,12 +29,14 @@ mod timings;
 #[macro_use]
 mod cmd;
 
+mod agecrypt;
 mod aqua;
 mod backend;
 pub(crate) mod build_time;
 mod cache;
 mod cli;
 mod config;
+pub(crate) mod deps_graph;
 mod direnv;
 mod dirs;
 pub(crate) mod duration;
@@ -45,6 +47,7 @@ mod exit;
 #[cfg_attr(windows, path = "fake_asdf_windows.rs")]
 mod fake_asdf;
 mod file;
+pub(crate) mod forgejo;
 mod git;
 pub(crate) mod github;
 pub(crate) mod gitlab;
@@ -60,10 +63,13 @@ pub(crate) mod logger;
 pub(crate) mod maplit;
 mod migrate;
 mod minisign;
+mod netrc;
 pub(crate) mod parallel;
 mod path;
 mod path_env;
+mod platform;
 mod plugins;
+mod prepare;
 mod rand;
 mod redactions;
 mod registry;
@@ -103,7 +109,16 @@ fn main() -> eyre::Result<()> {
 }
 
 async fn main_() -> eyre::Result<()> {
-    color_eyre::install()?;
+    // Configure color-eyre based on color preferences
+    if *env::CLICOLOR == Some(false) {
+        // Use blank theme (no colors) when colors are disabled
+        color_eyre::config::HookBuilder::new()
+            .theme(color_eyre::config::Theme::new())
+            .install()?;
+    } else {
+        // Use default installation with colors
+        color_eyre::install()?;
+    }
     install_panic_hook();
     if std::env::current_dir().is_ok() {
         unsafe {
@@ -127,15 +142,21 @@ async fn main_() -> eyre::Result<()> {
 }
 
 fn handle_err(err: Report) -> eyre::Result<()> {
-    if let Some(err) = err.downcast_ref::<std::io::Error>() {
-        if err.kind() == std::io::ErrorKind::BrokenPipe {
-            return Ok(());
-        }
-    }
-    show_github_rate_limit_err(&err);
-    if *env::MISE_FRIENDLY_ERROR
-        || (!cfg!(debug_assertions) && log::max_level() < log::LevelFilter::Debug)
+    if let Some(err) = err.downcast_ref::<std::io::Error>()
+        && err.kind() == std::io::ErrorKind::BrokenPipe
     {
+        return Ok(());
+    }
+
+    // Check for miette diagnostic errors and render them specially
+    if let Some(diagnostic) = err.downcast_ref::<config::config_file::diagnostic::MiseDiagnostic>()
+    {
+        eprintln!("{}", diagnostic.render());
+        exit(1);
+    }
+
+    show_github_rate_limit_err(&err);
+    if *env::MISE_FRIENDLY_ERROR {
         display_friendly_err(&err);
         exit(1);
     }

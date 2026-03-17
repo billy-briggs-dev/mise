@@ -63,11 +63,15 @@ Registry-based package manager with strong security features:
 - **Sources**: Primarily GitHub but supports other sources through registry configuration
 - **Security**: Comprehensive checksums, signatures, and verification
 
-#### ubi - Universal Binary Installer
+#### ubi - Universal Binary Installer (Deprecated)
+
+::: warning
+The ubi backend is deprecated. Use the [github backend](/dev-tools/backends/github) instead.
+:::
 
 Zero-configuration installer that works with any GitHub/GitLab repository following standard conventions:
 
-- **Usage**: `ubi:BurntSushi/ripgrep`
+- **Usage**: `ubi:BurntSushi/ripgrep` → migrate to `github:BurntSushi/ripgrep`
 - **Requirements**: Repository must follow standard release tarball conventions
 - **Sources**: Primarily GitHub releases, with GitLab support (rarely used in mise)
 - **Configuration**: None required - automatically detects and downloads appropriate binaries
@@ -85,11 +89,22 @@ Support for external plugin ecosystems:
 When you specify a tool, mise determines the backend using this priority:
 
 1. **Explicit backend**: `mise use aqua:golangci/golangci-lint`
-2. **Registry lookup**: `mise use golangci-lint` → checks registry for default backend
-3. **Core tools**: `mise use node` → uses built-in core backend
-4. **Fallback**: If not found, suggests available backends
+2. **Environment variable override**: `MISE_BACKENDS_<TOOL>` (see below)
+3. **Registry lookup**: `mise use golangci-lint` → checks registry for default backend
+4. **Core tools**: `mise use node` → uses built-in core backend
+5. **Fallback**: If not found, suggests available backends
 
 The [mise registry](../registry.md) defines a priority order for which backend to use for each tool, so typically end-users don't need to know which backend to choose unless they want tools not available in the registry or want to override the default selection.
+
+### Environment Variable Overrides
+
+You can override the backend for any tool using the `MISE_BACKENDS_<TOOL>` environment variable pattern. The tool name is converted to SHOUTY_SNAKE_CASE (uppercase with underscores replacing hyphens).
+
+```bash
+# Use vfox backend for php
+export MISE_BACKENDS_PHP='vfox:mise-plugins/vfox-php'
+mise install php@latest
+```
 
 ### Registry System
 
@@ -97,20 +112,24 @@ The [registry](../registry.md) (`mise registry`) maps short names to full backen
 
 ```toml
 # ~/.config/mise/config.toml
-[aliases]
+[tool_alias]
 go = "core:go"                    # Use core backend
 terraform = "aqua:hashicorp/terraform"  # Use aqua backend
 ```
 
 ## Backend Capabilities Comparison
 
-| Feature | Core | npm/pipx/cargo | aqua | ubi | Backend Plugins | Tool Plugins (vfox) | asdf Plugins (legacy) |
-|---------|------|----------------|------|-----|-----------------|---------------------|-----------------------|
-| **Speed** | ✅ | ⚠️ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ |
-| **Security** | ✅ | ⚠️ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
-| **Windows Support** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| **Env Var Support** | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ |
-| **Custom Scripts** | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ |
+| Feature                   | Core | npm/pipx/cargo | aqua | ubi | Backend Plugins | Tool Plugins (vfox) | asdf Plugins (legacy) |
+| ------------------------- | ---- | -------------- | ---- | --- | --------------- | ------------------- | --------------------- |
+| **Speed**                 | ✅   | ⚠️             | ✅   | ✅  | ⚠️              | ⚠️                  | ⚠️                    |
+| **Security**              | ✅   | ⚠️             | ✅   | ⚠️  | ⚠️              | ⚠️                  | ⚠️                    |
+| **Windows Support**       | ✅   | ✅             | ✅   | ✅  | ✅              | ✅                  | ❌                    |
+| **Env Var Support**       | ✅   | ❌             | ❌   | ❌  | ✅              | ✅                  | ✅                    |
+| **Custom Scripts**        | ✅   | ❌             | ❌   | ❌  | ✅              | ✅                  | ✅                    |
+| **Built-in Modules**      | ✅   | ❌             | ❌   | ❌  | ✅              | ✅                  | ❌                    |
+| **Security Attestations** | ❌   | ❌             | ✅   | ❌  | ✅              | ✅                  | ❌                    |
+| **Multi-tool Plugins**    | ❌   | ❌             | ❌   | ❌  | ✅              | ❌                  | ❌                    |
+| **Progress/Logging**      | ✅   | ✅             | ✅   | ✅  | ✅              | ✅                  | ❌                    |
 
 ## When to Use Each Backend
 
@@ -136,13 +155,17 @@ Core tools should generally always be used when available, as they provide the b
 - The tool is already available in the [aqua registry](https://github.com/aquaproj/aqua-registry)
 - You're willing to contribute tools to the aqua registry for tools not yet available
 
-### Use **ubi** when
+### Use **github** when
 
-- Installing pre-compiled binaries from GitHub/GitLab releases
+- Installing pre-compiled binaries from GitHub releases
 - The repository follows standard conventions for release tarballs
 - You want zero configuration - no registry setup required
 - You need simple, fast binary installation
 - The tool doesn't require complex build processes or environment setup
+
+::: info
+The `ubi` backend still works but is deprecated in favor of `github`. Replace `ubi:owner/repo` with `github:owner/repo`.
+:::
 
 ### Use **Backend Plugins** when
 
@@ -199,8 +222,8 @@ disable_backends = ["asdf", "vfox"] # Don't use these backends
 ```toml
 # mise.toml
 [tools]
-node = "core:node@20" # Explicitly use core backend
-yarn = "aqua:yarn"    # Use aqua backend instead of default (vfox)
+"core:node" = "20"     # Explicitly use core backend
+"aqua:yarn" = "latest" # Use aqua backend instead of default (vfox)
 ```
 
 ### Backend-Specific Settings

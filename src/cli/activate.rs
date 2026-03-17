@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use crate::config::Settings;
 use crate::env::PATH_KEY;
 use crate::file::touch_dir;
 use crate::path_env::PathEnv;
 use crate::shell::{ActivateOptions, ActivatePrelude, Shell, ShellType, get_shell};
+use crate::toolset::env_cache::CachedEnv;
 use crate::{dirs, env};
 use eyre::Result;
 use itertools::Itertools;
@@ -28,16 +30,25 @@ use itertools::Itertools;
 #[clap(verbatim_doc_comment, after_long_help = AFTER_LONG_HELP)]
 pub struct Activate {
     /// Shell type to generate the script for
-    #[clap(long, short, hide = true)]
-    shell: Option<ShellType>,
-
-    /// Shell type to generate the script for
     #[clap()]
     shell_type: Option<ShellType>,
 
-    /// Show "mise: <PLUGIN>@<VERSION>" message when changing directories
-    #[clap(long, hide = true)]
-    status: bool,
+    /// Suppress non-error messages
+    #[clap(long, short)]
+    quiet: bool,
+
+    /// Shell type to generate the script for
+    #[clap(long, short, hide = true)]
+    shell: Option<ShellType>,
+
+    /// Do not automatically call hook-env
+    ///
+    /// This can be helpful for debugging mise. If you run `eval "$(mise activate --no-hook-env)"`, then
+    /// you can call `mise hook-env` manually which will output the env vars to stdout without actually
+    /// modifying the environment. That way you can do things like `mise hook-env --trace` to get more
+    /// information or just see the values that hook-env is outputting.
+    #[clap(long)]
+    no_hook_env: bool,
 
     /// Use shims instead of modifying PATH
     /// Effectively the same as:
@@ -49,18 +60,9 @@ pub struct Activate {
     #[clap(long, verbatim_doc_comment)]
     shims: bool,
 
-    /// Suppress non-error messages
-    #[clap(long, short)]
-    quiet: bool,
-
-    /// Do not automatically call hook-env
-    ///
-    /// This can be helpful for debugging mise. If you run `eval "$(mise activate --no-hook-env)"`, then
-    /// you can call `mise hook-env` manually which will output the env vars to stdout without actually
-    /// modifying the environment. That way you can do things like `mise hook-env --trace` to get more
-    /// information or just see the values that hook-env is outputting.
-    #[clap(long)]
-    no_hook_env: bool,
+    /// Show "mise: <PLUGIN>@<VERSION>" message when changing directories
+    #[clap(long, hide = true)]
+    status: bool,
 }
 
 impl Activate {
@@ -88,10 +90,13 @@ impl Activate {
     fn activate_shims(&self, shell: &dyn Shell, mise_bin: &Path) -> std::io::Result<()> {
         let exe_dir = mise_bin.parent().unwrap();
         let mut prelude = vec![];
-        if let Some(p) = self.prepend_path(exe_dir) {
+        // For shells with native path dedup/reorder (fish), always emit path commands
+        // using MovePrependEnv so entries get moved to front on re-source (e.g. VS Code).
+        // For other shells, keep the is_dir_in_path guard to avoid PATH growth on re-source.
+        if let Some(p) = self.shims_prepend_path(shell, exe_dir) {
             prelude.push(p);
         }
-        if let Some(p) = self.prepend_path(&dirs::SHIMS) {
+        if let Some(p) = self.shims_prepend_path(shell, &dirs::SHIMS) {
             prelude.push(p);
         }
         miseprint!("{}", shell.format_activate_prelude(&prelude))?;
@@ -114,6 +119,17 @@ impl Activate {
         if let Some(prepend_path) = self.prepend_path(exe_dir) {
             prelude.push(prepend_path);
         }
+
+        // Generate encryption key for env cache if caching is enabled
+        // This key is session-scoped and lost when the shell closes
+        if Settings::get().env_cache {
+            let key = CachedEnv::ensure_encryption_key();
+            prelude.push(ActivatePrelude::SetEnv(
+                "__MISE_ENV_CACHE_KEY".to_string(),
+                key,
+            ));
+        }
+
         miseprint!(
             "{}",
             shell.activate(ActivateOptions {
@@ -136,9 +152,32 @@ impl Activate {
             None
         }
     }
+
+    /// Used by activate_shims. For shells with native path dedup (fish), skips
+    /// the is_dir_in_path check and uses MovePrependEnv to reorder entries on
+    /// re-source. For other shells, falls back to prepend_path to avoid PATH growth.
+    fn shims_prepend_path(&self, shell: &dyn Shell, p: &Path) -> Option<ActivatePrelude> {
+        if !is_dir_not_in_nix(p) || p.is_relative() {
+            return None;
+        }
+        if shell.supports_move_path() {
+            Some(ActivatePrelude::MovePrependEnv(
+                PATH_KEY.to_string(),
+                p.to_string_lossy().to_string(),
+            ))
+        } else {
+            self.prepend_path(p)
+        }
+    }
 }
 
 fn remove_shims() -> std::io::Result<Option<ActivatePrelude>> {
+    // When not_found_auto_install is enabled, preserve shims in PATH so they can
+    // trigger auto-install for tools that aren't installed yet
+    if Settings::get().not_found_auto_install {
+        return Ok(None);
+    }
+
     let shims = dirs::SHIMS
         .canonicalize()
         .unwrap_or(dirs::SHIMS.to_path_buf());

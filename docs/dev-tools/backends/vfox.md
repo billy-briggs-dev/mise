@@ -1,6 +1,17 @@
-# Vfox Backend <Badge type="warning" text="experimental" />
+# Vfox Backend
+
+::: tip
+Vfox is the recommended plugin system for mise. It provides cross-platform support, built-in modules, and a modern hook-based architecture.
+:::
 
 [Vfox](https://github.com/version-fox/vfox) plugins may be used in mise to install tools.
+
+## Why vfox?
+
+- **Cross-platform** — plugins work on Windows, macOS, and Linux without platform-specific code
+- **Built-in modules** — HTTP, JSON, HTML parsing, archive extraction, semver comparison, and logging are all available out of the box, no external dependencies needed
+- **Security** — [tool plugins](../../tool-plugin-development.md) support attestation verification (GitHub artifact attestations, cosign signatures, SLSA provenance) for downloaded artifacts. When a tool plugin's `PreInstall` hook returns an `attestation` table, mise verifies it during install and records the result in `mise.lock`, protecting against downgrade attacks on subsequent installs. Backend plugins do not currently support attestation
+- **Modern architecture** — structured hooks with typed contexts, backend plugins for multi-tool management, rolling version checksums, and lock file support
 
 The code for this is inside the mise repository at [`./src/backend/vfox.rs`](https://github.com/jdx/mise/blob/main/src/backend/vfox.rs).
 
@@ -77,7 +88,17 @@ mise install my-plugin:some-tool@1.0.0
 mise use my-plugin:some-tool@latest
 ```
 
+### Install from Zip File
+
+```bash
+# Install a plugin from a zip file over HTTPS
+mise plugin install <plugin-name> <zip-url>
+# Example: Installing a plugin from a zip file
+mise plugin install vfox-cmake https://github.com/mise-plugins/vfox-cmake/archive/refs/heads/main.zip
+```
+
 For more information, see:
 
 - [Using Plugins](../../plugin-usage.md) - End-user guide
 - [Plugin Development](../../tool-plugin-development.md) - Developer guide
+- [Plugin Template](https://github.com/jdx/mise-tool-plugin-template) - Quick start template for creating plugins

@@ -7,7 +7,7 @@ use crate::toolset::{InstallOptions, ToolsetBuilder};
 use crate::ui::time;
 use crate::{dirs, env, file};
 use eyre::{Result, bail, eyre};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{collections::BTreeSet, sync::Arc};
 
 /// Test a tool installs and executes
@@ -17,19 +17,19 @@ pub struct TestTool {
     /// Tool(s) to test
     #[clap(required_unless_present_any = ["all", "all_config"])]
     pub tools: Option<Vec<ToolArg>>,
-    /// Test every tool specified in registry.toml
+    /// Test every tool specified in registry/
     #[clap(long, short, conflicts_with = "tools", conflicts_with = "all_config")]
     pub all: bool,
-    /// Test all tools specified in config files
-    #[clap(long, conflicts_with = "tools", conflicts_with = "all")]
-    pub all_config: bool,
-    /// Also test tools not defined in registry.toml, guessing how to test it
-    #[clap(long)]
-    pub include_non_defined: bool,
     /// Number of jobs to run in parallel
     /// [default: 4]
     #[clap(long, short, env = "MISE_JOBS", verbatim_doc_comment)]
     pub jobs: Option<usize>,
+    /// Test all tools specified in config files
+    #[clap(long, conflicts_with = "tools", conflicts_with = "all")]
+    pub all_config: bool,
+    /// Also test tools not defined in registry/, guessing how to test it
+    #[clap(long)]
+    pub include_non_defined: bool,
     /// Directly pipe stdin/stdout/stderr from plugin to user
     /// Sets --jobs=1
     #[clap(long, overrides_with = "jobs")]
@@ -84,6 +84,13 @@ impl TestTool {
                     ])?;
                 }
             };
+        }
+        if let Ok(github_summary) = env::var("GITHUB_STEP_SUMMARY") {
+            let mut content: String = "\n".into();
+            if !errored.is_empty() {
+                content.push_str(&format!("**Failed Tools**: {}\n", errored.join(", ")));
+            }
+            file::append(github_summary, content)?;
         }
         if !errored.is_empty() {
             bail!("tools failed: {}", errored.join(", "));
@@ -148,6 +155,46 @@ impl TestTool {
         cmd: &str,
         expected: &str,
     ) -> Result<()> {
+        // First, clean all backend data by removing directories
+        let pr = crate::ui::multi_progress_report::MultiProgressReport::get()
+            .add(&format!("cleaning {}", tool.short));
+
+        let mut cleaned_any = false;
+
+        // Remove entire installs directory for this tool
+        if tool.ba.installs_path.exists() {
+            info!(
+                "Removing installs directory: {}",
+                tool.ba.installs_path.display()
+            );
+            file::remove_all(&tool.ba.installs_path)?;
+            cleaned_any = true;
+        }
+
+        // Clear cache directory (contains metadata)
+        if tool.ba.cache_path.exists() {
+            info!("Removing cache directory: {}", tool.ba.cache_path.display());
+            file::remove_all(&tool.ba.cache_path)?;
+            cleaned_any = true;
+        }
+
+        // Clear downloads directory
+        if tool.ba.downloads_path.exists() {
+            info!(
+                "Removing downloads directory: {}",
+                tool.ba.downloads_path.display()
+            );
+            file::remove_all(&tool.ba.downloads_path)?;
+            cleaned_any = true;
+        }
+
+        pr.finish();
+
+        // Reset the config to clear in-memory backend metadata caches if we cleaned anything
+        if cleaned_any {
+            *config = Config::reset().await?;
+        }
+
         let mut args = vec![tool.clone()];
         args.extend(
             tool.ba
@@ -168,8 +215,8 @@ impl TestTool {
             raw: self.raw,
             ..Default::default()
         };
-        ts.install_missing_versions(config, &opts).await?;
-        ts.notify_if_versions_missing(config).await;
+        let (_, missing) = ts.install_missing_versions(config, &opts).await?;
+        ts.notify_missing_versions(missing);
         let tv = if let Some(tv) = ts
             .versions
             .get(tool.ba.as_ref())
@@ -188,7 +235,7 @@ impl TestTool {
             .which(config, &tv, cmd)
             .await?
             .unwrap_or(PathBuf::from(cmd));
-        if cfg!(windows) && which_cmd == PathBuf::from("which") {
+        if cfg!(windows) && which_cmd == Path::new("which") {
             which_cmd = PathBuf::from("where");
         }
         let cmd = format!("{} {}", which_cmd.display(), which_parts.join(" "));
@@ -207,6 +254,14 @@ impl TestTool {
             Some(0) => {}
             Some(code) => {
                 if code == 127 {
+                    // Show captured stdout (which may include stderr via 2>&1)
+                    // to help diagnose dynamic linker or missing library errors
+                    if let Ok(stdout) = String::from_utf8(res.stdout.clone()) {
+                        let stdout = stdout.trim();
+                        if !stdout.is_empty() {
+                            info!("command output:\n{stdout}");
+                        }
+                    }
                     let bin_dirs = backend.list_bin_paths(config, &tv).await?;
                     for bin_dir in &bin_dirs {
                         let bins = file::ls(bin_dir)?

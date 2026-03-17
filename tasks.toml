@@ -6,7 +6,7 @@ run = 'cargo clean'
 
 [release]
 description = 'Release the project'
-run = 'cargo release'
+run = 'cargo release --exclude-unchanged'
 
 [signal-test]
 description = 'Test signal handling in Node.js'
@@ -23,7 +23,7 @@ depends = ['lint:*']
 [build]
 alias = "b"
 run = "cargo build --all-features"
-run_windows = "cargo build --features clap_mangen"
+run_windows = "cargo build"
 description = "Build the project"
 #sources = ["Cargo.*", "src/**/*.rs"]
 #outputs = ["target/debug/mise"]
@@ -31,24 +31,20 @@ description = "Build the project"
 [docs]
 description = 'Start the documentation development server'
 depends = ['docs:setup']
-dir = "docs"
 run = "bun run docs:dev"
 
 ["docs:setup"]
 description = 'Install documentation dependencies'
-dir = "docs"
-run = ["cd .. && bun i", "bun i"]
+run = "bun i"
 
 ["docs:build"]
 description = 'Build the documentation site'
 depends = ["docs:setup"]
-dir = "docs"
 run = "bun run docs:build"
 
 ["docs:preview"]
 description = 'Preview the documentation site'
 depends = ["docs:build"]
-dir = "docs"
 run = "bun run docs:preview"
 
 ["docs:demos"]
@@ -95,18 +91,14 @@ set -xeuo pipefail
 mise completion bash > completions/mise.bash
 mise completion zsh > completions/_mise
 mise completion fish > completions/mise.fish
+mise completion powershell > completions/mise.ps1
 '''
-
-["render:settings"]
-description = 'Render settings documentation'
-run = "tsx xtasks/render/settings.ts"
-depends = ['docs:setup']
 
 ["render:mangen"]
 description = 'Generate man pages'
-depends = ["build"]
+depends = ["render:usage"]
 env = { NO_COLOR = "1" }
-run = "mise render-mangen"
+run = "usage generate manpage --file mise.usage.kdl > man/man1/mise.1"
 
 ["render:fig"]
 description = 'Generate Fig completion spec'
@@ -146,32 +138,6 @@ run = ["mise tasks run test:unit", "mise tasks run test:e2e"]
 description = "run unit tests"
 run = "cargo test --all-features"
 env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
-
-["docker:image"]
-hide = true                                                                                                                     # docker stuff is not working correctly right now
-description = "build docker image from Dockerfile"
-run = 'docker build --build-arg GITHUB_TOKEN=$GITHUB_API_TOKEN $root -f $root/packaging/dev/Dockerfile -t ghcr.io/jdx/mise:dev'
-
-["docker:run"]
-hide = true                                                                                                                                                                            # docker stuff is not working correctly right now
-description = "run a command inside of development docker container"
-run = 'docker run -ti --rm -e GITHUB_API_TOKEN -e TEST_ALL -v $root:/mise -v /tmp/mise/target:/tmp/mise/target -v /tmp/mise/registry:/tmp/mise/registry -w /mise ghcr.io/jdx/mise:dev'
-depends = ["docker:image"]
-
-["docker:cargo"]
-hide = true                                                      # docker stuff is not working correctly right now
-description = "run cargo inside of development docker container"
-run = 'mise tasks run docker:run cargo'
-
-["docker:mise"]
-hide = true                                                     # docker stuff is not working correctly right now
-description = "run mise inside of development docker container"
-run = "mise tasks run -- docker:cargo run --"
-
-["docker:e2e"]
-hide = true                                                          # docker stuff is not working correctly right now
-description = "run e2e tests inside of development docker container"
-run = "mise tasks run docker:mise run test:e2e"
 
 ["test:shuffle"]
 description = 'Run tests with shuffling enabled'

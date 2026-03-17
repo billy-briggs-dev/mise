@@ -22,6 +22,10 @@ It's also compatible
 with asdf `.tool-versions` files as well as [idiomatic version files](/configuration#idiomatic-version-files) like `.node-version` and
 `.ruby-version`. See [configuration](/configuration) for more details.
 
+When specifying tool versions, you can also refer to environment variables defined in your config hierarchy,
+including values produced by env directives like `_.source`, `_.file`, or env modules. These are resolved
+before tool version templates are rendered.
+
 ::: info
 mise is inspired by [asdf](https://asdf-vm.com) and can leverage asdf's
 vast [plugin ecosystem](https://github.com/mise-plugins/registry)
@@ -107,8 +111,14 @@ The cleanest way to specify nested options is using TOML tables:
 version = "1.0.0"
 
 [tools."http:my-tool".platforms]
-macos-x64 = { url = "https://example.com/my-tool-macos-x64.tar.gz", checksum = "sha256:abc123" }
-linux-x64 = { url = "https://example.com/my-tool-linux-x64.tar.gz", checksum = "sha256:def456" }
+macos-x64 = {
+  url = "https://example.com/my-tool-macos-x64.tar.gz",
+  checksum = "sha256:abc123",
+}
+linux-x64 = {
+  url = "https://example.com/my-tool-linux-x64.tar.gz",
+  checksum = "sha256:def456",
+}
 ```
 
 ### Dotted Notation
@@ -152,6 +162,7 @@ node = { version = "22", postinstall = "corepack enable" }
 ```
 
 Behavior:
+
 - The command runs once the install completes successfully for that tool/version.
 - The tool's bin path is on PATH during the command, so you can invoke the installed tool directly.
 - Environment variables include `MISE_TOOL_INSTALL_PATH` pointing to the tool's install directory.
@@ -170,14 +181,15 @@ ripgrep = { version = "latest", os = ["linux", "macos"] }
 "npm:windows-terminal" = { version = "latest", os = ["windows"] }
 
 # Works with other options
-"cargo:usage-cli" = { 
-    version = "latest", 
+"cargo:usage-cli" = {
+    version = "latest",
     os = ["linux", "macos"],
     install_env = { RUST_BACKTRACE = "1" }
 }
 ```
 
 The `os` field accepts an array of operating system identifiers:
+
 - `"linux"` - All Linux distributions
 - `"macos"` - macOS (Darwin)
 - `"windows"` - Windows
@@ -227,22 +239,22 @@ For some users, `mise use` might be the only command you need to learn. It will 
 
 ```shell
 > cd my-project
-> mise use node@22
+> mise use node@24
 # download node, verify signature...
-mise node@22.12.0 ✓ installed
-mise ~/my-project/mise.toml tools: node@22.12.0 # mise.toml created/updated
+mise node@24.x.x ✓ installed
+mise ~/my-project/mise.toml tools: node@24.x.x # mise.toml created/updated
 
 > which node
-~/.local/share/installs/node/22.12.0/bin/node
+~/.local/share/installs/node/24.x.x/bin/node
 ```
 
-`mise use node@22` will install the latest version of node-22 and create/update the
+`mise use node@24` will install the latest version of node-24 and create/update the
 `mise.toml`
 config file in the local directory. Anytime you're in that directory, that version of `node` will be
 used.
 
-`mise use -g node@22` will do the same but update the [global config](/configuration.html#global-config-config-mise-config-toml) (~/.config/mise/config.toml) so
-unless there is a config file in the local directory hierarchy, node-22 will be the default version
+`mise use -g node@24` will do the same but update the [global config](/configuration.html#global-config-config-mise-config-toml) (~/.config/mise/config.toml) so
+unless there is a config file in the local directory hierarchy, node-24 will be the default version
 for
 the user.
 
@@ -304,14 +316,18 @@ environment with all of your tools.
 mise provides several mechanisms to automatically install missing tools or versions as needed. Below, these are grouped by how and when they are triggered, with relevant settings for each. All mechanisms require the global [auto_install](/configuration/settings.html#auto_install) setting to be enabled (**all auto_install settings are enabled by default**).
 
 ### On-Demand Execution ([`mise x`](/cli/exec), [`mise r`](/cli/run))
+
 When you run a command like [`mise x`](/cli/exec) or [`mise r`](/cli/run), mise will automatically install any missing tool versions required to execute the command.
+
 - **When it triggers:** Whenever you use [`mise x`](/cli/exec) or [`mise r`](/cli/run) with a tool/version that is not yet installed.
 - **How to control:**
   - Setting: [`exec_auto_install`](/configuration/settings.html#exec_auto_install) (default: true)
   - Setting: [`task_auto_install`](/configuration/settings.html#task_auto_install) (default: true)
 
 ### Command Not Found Handler (Shell Integration)
+
 If you type a command in your shell (e.g., `node`) and it is not found, mise can attempt to auto-install the missing tool version if it knows which tool provides that binary.
+
 - **When it triggers:** When a command is not found in the shell and the handler is enabled.
 - **How to control:**
   - Setting: [`not_found_auto_install`](/configuration/settings.html#not_found_auto_install) (default: true)

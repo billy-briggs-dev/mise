@@ -2,9 +2,9 @@
 
 See available tasks with `mise tasks`. To show tasks hidden with property `hide=true`, use the option `--hidden`.
 
-List dependencies of tasks with `mise task deps [tasks]...`.
+List dependencies of tasks with `mise tasks deps [tasks]...`.
 
-Run a task with `mise task run <task>`, `mise run <task>`, `mise r <task>`, or just `mise <task>`—however
+Run a task with `mise tasks run <task>`, `mise run <task>`, `mise r <task>`, or just `mise <task>`—however
 that last one you should never put into scripts or documentation because if mise ever adds a command with that name in a
 future mise version, the task will be shadowed and must be run with one of the other forms.
 
@@ -15,10 +15,10 @@ By default, tasks will execute with a maximum of 4 parallel jobs. Customize this
 label. By printing line-by-line we avoid interleaving output from parallel executions. However, if
 --jobs == 1, the output will be set to `interleave`.
 
-To just print stdout/stderr directly, use `--interleave`, the `task_output` setting, or `MISE_TASK_OUTPUT=interleave`.
+To just print stdout/stderr directly, use `--interleave`, the `task.output` setting, or `MISE_TASK_OUTPUT=interleave`.
 
 Stdin is not read by default. To enable this, set `raw = true` on the task that needs it. This will prevent
-it running in parallel with any other task-a RWMutex will get a write lock in this case. This also prevents redactions applied to the output.
+it running in parallel with any other task—a RWMutex will get a write lock in this case. This also prevents redactions applied to the output.
 
 Extra arguments will be passed to the task, for example, if we want to run in release mode:
 
@@ -138,8 +138,7 @@ depends = ["build"]
 
 This will ensure that the `build` task is run before the `test` task.
 
-You can also define a mise task to run other tasks sequentially (or in series).
-You can do this by calling `mise run <task>` in the `run` property of a task.
+You can also define a mise task to run other tasks in parallel or in series:
 
 ```toml
 [tasks.example1]
@@ -148,19 +147,12 @@ run = "echo 'example1'"
 [tasks.example2]
 run = "mise example2"
 
+[tasks.example3]
+run = "echo 'example3'"
+
 [tasks.one_by_one]
 run = [
-    'mise run example1',
-    'mise run example2',
-]
-```
-
-This assumes that `mise` is in your `PATH`. If you are using [mise generate bootstrap](/cli/generate/bootstrap.html) or if `mise` is not on `PATH`, it's better to use <span v-pre>[`{{mise_bin}}`](/templates.html#variables)</span> instead of `mise` in the task definition.
-
-```toml
-[tasks.one_by_one]
-run = [
-    '{{mise_bin}} run example1',
-    '{{mise_bin}} run example2',
+    { task = "example1" }, # will wait for example1 to finish before running the next step
+    { tasks = ["example2", "example3"] }, # these 2 are run in parallel
 ]
 ```

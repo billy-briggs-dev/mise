@@ -6,10 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Building and Testing
 - `mise run build` or `mise run b` - Build the project with cargo
+- `target/debug/mise` - Run the built binary directly
 - `mise run test` or `mise run t` - Run all tests (unit + e2e)
 - `mise run test:unit` - Run unit tests only
 - `mise run test:e2e` - Run end-to-end tests only
 - `mise run snapshots` - Update test snapshots with `cargo insta`
+
+### Debugging
+- Use `MISE_DEBUG=1` or `MISE_TRACE=1` environment variables to enable debug output (not `RUST_LOG`)
 
 ### Code Quality and Testing
 - `mise run lint` - Run all linting tasks
@@ -19,6 +23,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `mise run test:e2e [test_filename]...` - Run specific e2e tests (use this instead of executing test files directly)
 - `mise --cd crates/vfox run test` - Run tests for the vfox crate
 - `mise --cd crates/vfox run lint` - Run linting for the vfox crate
+- `mise --cd crates/vfox run lint-fix` - Run linting and fix issues for the vfox crate
+- `mise task ls` - List all available tasks
 
 ### Documentation and Generation
 - `mise run render` - Generate all documentation and completions
@@ -71,12 +77,13 @@ Mise is a Rust CLI tool that manages development environments, tools, tasks, and
 ### Configuration Files
 - `mise.toml` - Main configuration file format
 - `settings.toml` - Global settings definitions (generates code/docs)
-- `registry.toml` - Tool registry mappings
+- `registry/` - Tool registry mappings
 - `tasks.toml` - Project task definitions
 
 ### Test Structure
 - Unit tests within source files
-- E2E tests in `e2e/` directory organized by feature area
+- E2E tests in `e2e/` directory organized by feature area (e.g., `e2e/cli/`, `e2e/backend/`)
+- E2E tests are bash scripts using assertion helpers from `e2e/assert.sh` (e.g., `assert`, `assert_contains`, `assert_fail`)
 - Snapshot tests using `insta` crate for CLI output verification
 - Windows-specific tests in `e2e-win/`
 
@@ -95,28 +102,41 @@ All commit messages and PR titles MUST follow conventional commit format:
 
 **Types:**
 - `feat:` - New features
-- `fix:` - Bug fixes
+- `fix:` - Bug fixes that affect the CLI behavior (not CI, docs, or infrastructure)
 - `refactor:` - Code refactoring
-- `docs:` - Documentation
-- `style:` - Code style/formatting
+- `docs:` - Documentation changes
+- `style:` - Code style/formatting (no logic changes)
 - `perf:` - Performance improvements
 - `test:` - Testing changes
-- `chore:` - Maintenance tasks
-- `chore(deps):` - Dependency updates
-- `registry:` - New tool additions to the registry (no scope needed)
+- `chore:` - Maintenance tasks, releases, dependency updates, CI/infrastructure changes
+- `security:` - Security-related changes
+- `registry:` - Any changes to `registry/` (no scope needed, use for both new tools and fixes)
 
-**Common Scopes:** `aqua`, `cli`, `config`, `backend`, `tool`, `env`, `task`, `api`, `ui`, `core`, `deps`, `schema`, `doctor`, `shim`, `security`
+**Scopes:**
+- For command-specific changes, use the command name: `install`, `activate`, `use`, `exec`, etc.
+- For subsystem changes: `config`, `backend`, `env`, `task`, `vfox`, `python`, `github`, `release`, `completions`, `http`, `schema`, `doctor`, `shim`, `core`, `deps`, `ci`
+- Use `task` (not `run`) for task-related changes, even if the code lives in `src/cli/run.rs` or `src/cmd.rs`
+
+**Description Style:**
+- Use lowercase after the colon
+- Use imperative mood ("add feature" not "added feature")
+- Keep it concise but descriptive
 
 **Examples:**
-- `feat(cli): add new command for tool management`
-- `fix(config): resolve parsing issue with nested tables`
-- `test(e2e): add tests for tool installation`
-- `registry: add trunk metalinter (#5875)` - Adding new tool to registry
+- `fix(install): resolve version mismatch for previously installed tools`
+- `feat(activate): add fish shell support`
+- `feat(vfox): add semver Lua module for version sorting`
+- `feat(env): add environment caching with module cacheability support`
+- `docs(contributing): update hk usages`
+- `chore: release 2026.1.6`
+- `chore(ci): add FORGEJO_TOKEN for API authentication`
+- `registry: add miller`
 
 ### Pre-commit Process
-1. Run `mise run lint-fix` and `git add` any lint fixes before committing
-2. Use `mise run test:e2e [test_filename]...` for running specific e2e tests
-3. Never run e2e tests by executing them directly - always use the mise task
+1. Run `hk install --mise` once to set up pre-commit hooks (runs `hk fix` automatically on commit)
+2. Run `mise run lint-fix` and `git add` any lint fixes before committing
+3. Use `mise run test:e2e [test_filename]...` for running specific e2e tests
+4. Never run e2e tests by executing them directly - always use the mise task
 
 ## Important Implementation Notes
 
@@ -129,7 +149,7 @@ When implementing new tool backends, follow the pattern in `src/backend/mod.rs`.
 - Plugin metadata is defined in `mise.plugin.toml` files
 
 ### Configuration Parsing
-The configuration system supports multiple file formats and environment-specific configs. Changes to settings require updating `settings.toml` and running `mise run render:settings`.
+The configuration system supports multiple file formats and environment-specific configs. Changes to settings require updating `settings.toml` and running `mise run render:schema`.
 
 ### Testing Strategy
 - E2E tests are organized by feature area (cli/, config/, backend/, etc.)
@@ -141,3 +161,21 @@ The configuration system supports multiple file formats and environment-specific
 - Windows-specific implementations in files ending with `_windows.rs`
 - Platform-specific tool installation logic in core plugins
 - Shim system varies by platform (especially Windows)
+- we don't chmod mise e2e tests to be executable
+
+## GitHub Interactions
+
+When posting comments on GitHub PRs or discussions, always include a note that the comment was AI-generated (e.g., "*This comment was generated by Claude Code.*").
+
+## Documentation
+
+### URL Structure
+When referencing mise documentation URLs, use the correct path structure based on the `docs/` directory layout:
+
+- **Dev tools & backends**: `mise.jdx.dev/dev-tools/backends/<backend>.html` (e.g., `mise.jdx.dev/dev-tools/backends/s3.html`)
+- **Configuration**: `mise.jdx.dev/configuration/...`
+- **Tasks**: `mise.jdx.dev/tasks/...`
+- **Environments**: `mise.jdx.dev/environments/...`
+- **CLI reference**: `mise.jdx.dev/cli/...`
+
+Do NOT use shortened paths like `mise.jdx.dev/backends/...` - always include the full path matching the `docs/` directory structure.

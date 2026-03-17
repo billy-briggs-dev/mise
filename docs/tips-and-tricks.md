@@ -102,7 +102,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v3
       - run: node -v # will be the node version from `mise.toml`/`.tool-versions`
 ```
 
@@ -128,17 +128,30 @@ Don't do this inside of scripts because mise may add a command in a future versi
 
 ## Software verification
 
-Install cosign, slsa-verifier, and gpg (cosign and slsa-verifier can be installed with mise) in order to verify tools automatically.
+mise provides **native software verification** for aqua tools without requiring external dependencies. For aqua tools, Cosign/Minisign signatures, SLSA provenance, and GitHub artifact attestations are verified automatically using mise's built-in implementation.
+
+For other verification needs (like GPG), you can install additional tools:
 
 ```sh
 brew install gpg
-mise use -g cosign slsa-verifier
+# Note: cosign and slsa-verifier are no longer needed for aqua tools
+# mise now handles verification natively
+```
+
+To configure aqua verification (all enabled by default):
+
+```sh
+# Disable specific verification methods if needed
+export MISE_AQUA_COSIGN=false
+export MISE_AQUA_SLSA=false
+export MISE_AQUA_GITHUB_ATTESTATIONS=false
+export MISE_AQUA_MINISIGN=false
 ```
 
 ## [`mise up --bump`](/cli/upgrade.html)
 
 Use `mise up --bump` to upgrade all software to the latest version and update `mise.toml` files. This keeps the same semver range as before,
-so if you had `node = "20"` and node 22 is the latest, `mise up --bump node` will change `mise.toml` to `node = "22"`.
+so if you had `node = "22"` and node 24 is the latest, `mise up --bump node` will change `mise.toml` to `node = "24"`.
 
 ## cargo-binstall
 
@@ -201,7 +214,7 @@ This is helpful figuring out which order the config files are loaded in to figur
 
 ## `mise.lock`
 
-If you enable experimental mode, mise will update `mise.lock` with full versions and tarball checksums (if supported by the backend).
+When lockfiles are enabled, mise will update `mise.lock` with full versions and tarball checksums (if supported by the backend).
 These can be updated with [`mise up`](/cli/upgrade.html). You need to manually create the lockfile, then mise will add the tools to it:
 
 ```sh

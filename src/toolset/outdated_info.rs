@@ -1,6 +1,6 @@
 use crate::semver::{chunkify_version, split_version_prefix};
 use crate::toolset;
-use crate::toolset::{ToolRequest, ToolSource, ToolVersion};
+use crate::toolset::{ResolveOptions, ToolRequest, ToolSource, ToolVersion};
 use crate::{Result, config::Config};
 use serde_derive::Serialize;
 use std::{
@@ -10,7 +10,7 @@ use std::{
 use tabled::Tabled;
 use versions::Version;
 
-#[derive(Debug, Serialize, Clone, Tabled)]
+#[derive(Debug, Serialize, Clone, Tabled, PartialEq, Eq, Hash)]
 pub struct OutdatedInfo {
     pub name: String,
     #[serde(skip)]
@@ -53,15 +53,24 @@ impl OutdatedInfo {
         config: &Arc<Config>,
         tv: ToolVersion,
         bump: bool,
+        opts: &ResolveOptions,
     ) -> eyre::Result<Option<Self>> {
         let t = tv.backend()?;
         // prefix is something like "temurin-" or "corretto-"
         let (prefix, _) = split_version_prefix(&tv.request.version());
         let latest_result = if bump {
-            t.latest_version(config, Some(prefix.clone()).filter(|s| !s.is_empty()))
-                .await
+            // Note: Backend's latest_version_with_opts takes individual parameters,
+            // not a ResolveOptions struct like ToolVersion's method
+            t.latest_version_with_opts(
+                config,
+                Some(prefix.clone()).filter(|s| !s.is_empty()),
+                opts.before_date,
+            )
+            .await
         } else {
-            tv.latest_version(config).await.map(Option::from)
+            tv.latest_version_with_opts(config, opts)
+                .await
+                .map(Option::from)
         };
         let latest = match latest_result {
             Ok(Some(latest)) => latest,
@@ -80,48 +89,58 @@ impl OutdatedInfo {
             .as_ref()
             .is_some_and(|c| !toolset::is_outdated_version(c, &oi.latest))
         {
-            trace!("skipping up-to-date version {}", oi.tool_version);
-            return Ok(None);
+            // Check if this is a rolling version (like "nightly") with a new checksum
+            let rolling_outdated = t
+                .is_rolling_version_outdated(config, &oi.tool_version.request.version())
+                .await;
+            if !rolling_outdated {
+                trace!("skipping up-to-date version {}", oi.tool_version);
+                return Ok(None);
+            }
+            trace!(
+                "rolling version {} has updates (checksum changed)",
+                oi.tool_version.request.version()
+            );
         }
         if bump {
             let old = oi.tool_version.request.version();
             let old = old.strip_prefix(&prefix).unwrap_or_default();
             let new = oi.latest.strip_prefix(&prefix).unwrap_or_default();
-            if let Some(bumped_version) = check_semver_bump(old, new) {
-                if bumped_version != oi.tool_version.request.version() {
-                    oi.bump = match oi.tool_request.clone() {
-                        ToolRequest::Version {
-                            version: _version,
+            if let Some(bumped_version) = check_semver_bump(old, new)
+                && bumped_version != oi.tool_version.request.version()
+            {
+                oi.bump = match oi.tool_request.clone() {
+                    ToolRequest::Version {
+                        version: _version,
+                        backend,
+                        options,
+                        source,
+                    } => {
+                        oi.tool_request = ToolRequest::Version {
                             backend,
                             options,
                             source,
-                        } => {
-                            oi.tool_request = ToolRequest::Version {
-                                backend,
-                                options,
-                                source,
-                                version: format!("{prefix}{bumped_version}"),
-                            };
-                            Some(oi.tool_request.version())
-                        }
-                        ToolRequest::Prefix {
-                            prefix: _prefix,
+                            version: format!("{prefix}{bumped_version}"),
+                        };
+                        Some(oi.tool_request.version())
+                    }
+                    ToolRequest::Prefix {
+                        prefix: _prefix,
+                        backend,
+                        options,
+                        source,
+                    } => {
+                        oi.tool_request = ToolRequest::Prefix {
                             backend,
                             options,
                             source,
-                        } => {
-                            oi.tool_request = ToolRequest::Prefix {
-                                backend,
-                                options,
-                                source,
-                                prefix: format!("{prefix}{bumped_version}"),
-                            };
-                            Some(oi.tool_request.version())
-                        }
-                        _ => {
-                            warn!("upgrading non-version tool requests");
-                            None
-                        }
+                            prefix: format!("{prefix}{bumped_version}"),
+                        };
+                        Some(oi.tool_request.version())
+                    }
+                    _ => {
+                        warn!("upgrading non-version tool requests");
+                        None
                     }
                 }
             }
@@ -167,14 +186,23 @@ impl Display for OutdatedInfo {
 /// used with `mise outdated --bump` to determine what new semver range to use
 /// given old: "20" and new: "21.2.3", return Some("21")
 fn check_semver_bump(old: &str, new: &str) -> Option<String> {
-    if old == "latest" {
-        return Some("latest".to_string());
+    // Preserve known channel names as-is
+    const CHANNEL_NAMES: &[&str] = &[
+        "latest", "nightly", "stable", "beta", "dev", "canary", "edge", "lts",
+    ];
+    if CHANNEL_NAMES.iter().any(|&c| c.eq_ignore_ascii_case(old)) {
+        return Some(old.to_string());
     }
     if let Some(("prefix", old_)) = old.split_once(':') {
         return check_semver_bump(old_, new);
     }
     let old_chunks = chunkify_version(old);
     let new_chunks = chunkify_version(new);
+    // If old has no semver chunks but is non-empty, it's likely a channel name
+    // that we didn't recognize - preserve it as-is
+    if old_chunks.is_empty() && !old.is_empty() {
+        return Some(old.to_string());
+    }
     if !old_chunks.is_empty() && !new_chunks.is_empty() {
         if old_chunks.len() > new_chunks.len() {
             warn!(
@@ -273,6 +301,19 @@ mod tests {
         std::assert_eq!(
             check_semver_bump("latest", "20.0.0"),
             Some("latest".to_string())
+        );
+        // Channel names like "nightly", "stable", "beta" should be preserved
+        std::assert_eq!(
+            check_semver_bump("nightly", "0.10.0"),
+            Some("nightly".to_string())
+        );
+        std::assert_eq!(
+            check_semver_bump("stable", "0.10.0"),
+            Some("stable".to_string())
+        );
+        std::assert_eq!(
+            check_semver_bump("beta", "1.0.0-beta.1"),
+            Some("beta".to_string())
         );
     }
 }

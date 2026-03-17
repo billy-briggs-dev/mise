@@ -8,15 +8,17 @@ use crate::build_time::built_info;
 use crate::cli::self_update::SelfUpdate;
 use crate::cli::version;
 use crate::cli::version::VERSION;
-use crate::config::{Config, IGNORED_CONFIG_FILES};
+use crate::config::{Config, IGNORED_CONFIG_FILES, Settings};
 use crate::env::PATH_KEY;
 use crate::file::display_path;
 use crate::git::Git;
 use crate::plugins::PluginType;
 use crate::plugins::core::CORE_PLUGINS;
+use crate::registry::REGISTRY;
+use crate::toolset::install_state;
 use crate::toolset::{ToolVersion, Toolset, ToolsetBuilder};
 use crate::ui::{info, style};
-use crate::{backend, cmd, dirs, duration, env, file, shims};
+use crate::{backend, dirs, duration, env, file, shims};
 use console::{Alignment, pad_str, style};
 use heck::ToSnakeCase;
 use indexmap::IndexMap;
@@ -70,7 +72,9 @@ impl Doctor {
             "self_update_available".into(),
             SelfUpdate::is_available().into(),
         );
-        if env::is_activated() && shims_on_path() {
+        // Warn about shims+activate conflict, but not when not_found_auto_install is enabled
+        // since that intentionally preserves shims for auto-install functionality
+        if env::is_activated() && shims_on_path() && !Settings::get().not_found_auto_install {
             self.errors.push("shims are on PATH and mise is also activated. You should only use one of these methods.".to_string());
         }
         data.insert(
@@ -114,6 +118,7 @@ impl Doctor {
         let ts = config.get_toolset().await?;
         self.analyze_shims(&config, ts).await;
         self.analyze_plugins();
+        self.analyze_backend_mismatches();
         data.insert(
             "paths".into(),
             self.paths(ts)
@@ -141,6 +146,7 @@ impl Doctor {
         let tools = ts.list_versions_by_plugin().into_iter().map(|(f, tv)| {
             let versions: serde_json::Value = tv
                 .iter()
+                .filter(|tv| tv.request.is_os_supported())
                 .map(|tv: &ToolVersion| {
                     let mut tool = serde_json::Map::new();
                     match f.is_version_installed(&config, tv, true) {
@@ -187,7 +193,14 @@ impl Doctor {
         info::inline_section("activated", yn(env::is_activated()))?;
         info::inline_section("shims_on_path", yn(shims_on_path()))?;
         info::inline_section("self_update_available", yn(SelfUpdate::is_available()))?;
-        if env::is_activated() && shims_on_path() {
+        if !SelfUpdate::is_available()
+            && let Some(instructions) = crate::cli::self_update::upgrade_instructions_text()
+        {
+            info::section("self_update_instructions", instructions)?;
+        }
+        // Warn about shims+activate conflict, but not when not_found_auto_install is enabled
+        // since that intentionally preserves shims for auto-install functionality
+        if env::is_activated() && shims_on_path() && !Settings::get().not_found_auto_install {
             self.errors.push("shims are on PATH and mise is also activated. You should only use one of these methods.".to_string());
         }
 
@@ -211,6 +224,7 @@ impl Doctor {
         }
 
         self.analyze_plugins();
+        self.analyze_backend_mismatches();
 
         let env_vars = mise_env_vars()
             .into_iter()
@@ -284,12 +298,12 @@ impl Doctor {
         info::section("plugins", render_plugins())?;
 
         for backend in backend::list() {
-            if let Some(plugin) = backend.plugin() {
-                if !plugin.is_installed() {
-                    self.errors
-                        .push(format!("plugin {} is not installed", &plugin.name()));
-                    continue;
-                }
+            if let Some(plugin) = backend.plugin()
+                && !plugin.is_installed()
+            {
+                self.errors
+                    .push(format!("plugin {} is not installed", &plugin.name()));
+                continue;
             }
         }
 
@@ -393,6 +407,53 @@ impl Doctor {
         }
     }
 
+    fn analyze_backend_mismatches(&mut self) {
+        for (short, ist) in install_state::list_tools().iter() {
+            // Skip plugin-based tools (they use the plugin as backend)
+            if install_state::get_plugin_type(short).is_some() {
+                continue;
+            }
+
+            // Get stored backend, skip if none
+            let Some(stored_full) = &ist.full else {
+                continue;
+            };
+
+            // Get registry entry, skip if not in registry
+            let Some(rt) = REGISTRY.get(short.as_str()) else {
+                continue;
+            };
+
+            // Get recommended backend for current platform
+            let backends = rt.backends();
+            let Some(registry_full) = backends.first() else {
+                continue;
+            };
+
+            // Strip options for comparison (e.g., "github:repo[exe=bin]" -> "github:repo")
+            let stored_stripped = stored_full.split('[').next().unwrap_or(stored_full);
+            let registry_stripped = registry_full.split('[').next().unwrap_or(registry_full);
+
+            // Compare backends
+            if stored_stripped != registry_stripped {
+                let msg = if ist.explicit_backend {
+                    formatdoc!(
+                        r#"tool '{short}' installed with explicit backend '{stored_full}'
+                           differs from registry recommendation '{registry_full}'.
+                           To switch: mise uninstall --all {short} && mise install {short}"#
+                    )
+                } else {
+                    formatdoc!(
+                        r#"tool '{short}' installed with backend '{stored_full}'
+                           but registry now recommends '{registry_full}'.
+                           To migrate: mise uninstall --all {short} && mise install {short}"#
+                    )
+                };
+                self.warnings.push(msg);
+            }
+        }
+    }
+
     async fn paths(&mut self, ts: &Toolset) -> eyre::Result<Vec<PathBuf>> {
         let config = Config::get().await?;
         let env = ts.full_env(&config).await?;
@@ -447,7 +508,7 @@ fn mise_env_vars() -> Vec<(String, String)> {
         "MISE_GITHUB_ENTERPRISE_TOKEN",
         "MISE_GITLAB_ENTERPRISE_TOKEN",
     ];
-    env::vars()
+    env::vars_safe()
         .filter(|(k, _)| k.starts_with("MISE_"))
         .map(|(k, v)| {
             let v = if REDACT_KEYS.contains(&k.as_str()) {
@@ -545,16 +606,11 @@ fn shell() -> String {
 }
 
 fn aqua_registry_count() -> usize {
-    crate::aqua::aqua_registry::AQUA_STANDARD_REGISTRY_FILES.len()
+    aqua_registry::AQUA_STANDARD_REGISTRY_FILES.len()
 }
 
 fn aqua_registry_count_str() -> String {
-    let aqua_count = aqua_registry_count();
-    if aqua_count > 0 {
-        format!("baked in registry tools: {aqua_count}")
-    } else {
-        "baked in registry tools: 0 – aqua registry tools are not compiled into mise, will be fetched dynamically from https://mise-versions.jdx.dev".to_string()
-    }
+    format!("baked in registry tools: {}", aqua_registry_count())
 }
 
 static AFTER_LONG_HELP: &str = color_print::cstr!(

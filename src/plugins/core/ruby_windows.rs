@@ -5,6 +5,8 @@ use std::{
 };
 
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
+use crate::backend::normalize_idiomatic_contents;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
@@ -16,7 +18,7 @@ use crate::toolset::{ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
 use crate::{file, github, plugins};
 use async_trait::async_trait;
-use eyre::Result;
+use eyre::{Result, bail};
 use itertools::Itertools;
 use versions::Versioning;
 use xx::regex;
@@ -45,7 +47,7 @@ impl RubyPlugin {
         &self,
         config: &Arc<Config>,
         tv: &ToolVersion,
-        pr: &Box<dyn SingleReport>,
+        pr: &dyn SingleReport,
     ) -> Result<()> {
         let settings = Settings::get();
         let default_gems_file = file::replace_path(&settings.ruby.default_packages_file);
@@ -76,7 +78,7 @@ impl RubyPlugin {
         &self,
         config: &Arc<Config>,
         tv: &ToolVersion,
-        pr: &Box<dyn SingleReport>,
+        pr: &dyn SingleReport,
     ) -> Result<()> {
         pr.set_message("ruby -v".into());
         CmdLineRunner::new(self.ruby_path(tv))
@@ -90,7 +92,7 @@ impl RubyPlugin {
         &self,
         config: &Arc<Config>,
         tv: &ToolVersion,
-        pr: &Box<dyn SingleReport>,
+        pr: &dyn SingleReport,
     ) -> Result<()> {
         pr.set_message("gem -v".into());
         CmdLineRunner::new(self.gem_path(tv))
@@ -109,12 +111,8 @@ impl RubyPlugin {
         Ok(())
     }
 
-    async fn download(&self, tv: &ToolVersion, pr: &Box<dyn SingleReport>) -> Result<PathBuf> {
-        let arch = arch();
-        let url = format!(
-            "https://github.com/oneclick/rubyinstaller2/releases/download/RubyInstaller-{version}-1/rubyinstaller-{version}-1-{arch}.7z",
-            version = tv.version,
-        );
+    async fn download(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<PathBuf> {
+        let url = super::ruby_common::rubyinstaller_url(&tv.version);
         let filename = url.split('/').next_back().unwrap();
         let tarball_path = tv.download_path().join(filename);
 
@@ -144,7 +142,7 @@ impl RubyPlugin {
     }
 
     async fn verify(&self, ctx: &InstallContext, tv: &ToolVersion) -> Result<()> {
-        self.test_ruby(&ctx.config, tv, &ctx.pr).await
+        self.test_ruby(&ctx.config, tv, ctx.pr.as_ref()).await
     }
 }
 
@@ -153,7 +151,7 @@ impl Backend for RubyPlugin {
     fn ba(&self) -> &Arc<BackendArg> {
         &self.ba
     }
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
         // TODO: use windows set of versions
         //  match self.core.fetch_remote_versions_from_mise() {
         //      Ok(Some(versions)) => return Ok(versions),
@@ -163,36 +161,43 @@ impl Backend for RubyPlugin {
         let releases: Vec<GithubRelease> = github::list_releases("oneclick/rubyinstaller2").await?;
         let versions = releases
             .into_iter()
-            .map(|r| r.tag_name)
-            .filter_map(|v| {
+            .filter_map(|r| {
                 regex!(r"RubyInstaller-([0-9.]+)-.*")
-                    .replace(&v, "$1")
-                    .parse()
+                    .replace(&r.tag_name, "$1")
+                    .parse::<String>()
                     .ok()
+                    .map(|version| VersionInfo {
+                        version,
+                        created_at: Some(r.created_at),
+                        ..Default::default()
+                    })
             })
-            .unique()
-            .sorted_by_cached_key(|s: &String| (Versioning::new(s), s.to_string()))
+            .unique_by(|v| v.version.clone())
+            .sorted_by_cached_key(|v| (Versioning::new(&v.version), v.version.clone()))
             .collect();
         Ok(versions)
     }
 
-    fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         Ok(vec![".ruby-version".into(), "Gemfile".into()])
     }
 
-    fn parse_idiomatic_file(&self, path: &Path) -> Result<String> {
+    async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let v = match path.file_name() {
             Some(name) if name == "Gemfile" => parse_gemfile(&file::read_to_string(path)?),
             _ => {
                 // .ruby-version
-                let body = file::read_to_string(path)?;
+                let body = normalize_idiomatic_contents(&file::read_to_string(path)?);
                 body.trim()
                     .trim_start_matches("ruby-")
                     .trim_start_matches('v')
                     .to_string()
             }
         };
-        Ok(v)
+        if v.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![v])
     }
 
     async fn install_version_(
@@ -200,13 +205,23 @@ impl Backend for RubyPlugin {
         ctx: &InstallContext,
         mut tv: ToolVersion,
     ) -> eyre::Result<ToolVersion> {
-        let tarball = self.download(&tv, &ctx.pr).await?;
+        if !super::ruby_common::is_mri_version(&tv.version) {
+            bail!(
+                "Ruby engine '{}' is not supported on Windows.\n\
+                 Only standard MRI Ruby versions can be installed via RubyInstaller2.",
+                tv.version
+            );
+        }
+        let tarball = self.download(&tv, ctx.pr.as_ref()).await?;
         self.verify_checksum(ctx, &mut tv, &tarball)?;
         self.install(ctx, &tv, &tarball).await?;
         self.verify(ctx, &tv).await?;
         self.install_rubygems_hook(&tv)?;
-        self.test_gem(&ctx.config, &tv, &ctx.pr).await?;
-        if let Err(err) = self.install_default_gems(&ctx.config, &tv, &ctx.pr).await {
+        self.test_gem(&ctx.config, &tv, ctx.pr.as_ref()).await?;
+        if let Err(err) = self
+            .install_default_gems(&ctx.config, &tv, ctx.pr.as_ref())
+            .await
+        {
             warn!("failed to install default ruby gems {err:#}");
         }
         Ok(tv)

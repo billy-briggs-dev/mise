@@ -137,41 +137,11 @@ Run all lint checks
 
 Automatically fix lint issues
 
-## `lint:actionlint`
-
-- **Usage**: `lint:actionlint`
-
-Lint GitHub Actions workflows
-
-## `lint:cargo-fmt`
-
-- **Usage**: `lint:cargo-fmt`
-
-Check Rust code formatting with cargo fmt
-
 ## `lint:hk`
 
 - **Usage**: `lint:hk`
 
 Lint HK files
-
-## `lint:markdownlint`
-
-- **Usage**: `lint:markdownlint`
-
-Lint Markdown files
-
-## `lint:ripgrep`
-
-- **Usage**: `lint:ripgrep`
-
-Lint using ripgrep
-
-## `lint:toml`
-
-- **Usage**: `lint:toml`
-
-Lint TOML files
 
 ## `pre-commit`
 
@@ -225,19 +195,19 @@ Render help documentation
 
 ## `render:mangen`
 
-- Depends: build
+- Depends: render:usage
 
 - **Usage**: `render:mangen`
 
 Generate man pages
 
-## `render:settings`
+## `render:schema`
 
 - Depends: docs:setup
 
-- **Usage**: `render:settings`
+- **Usage**: `render:schema`
 
-Render settings documentation
+Render JSON schema
 
 ## `render:usage`
 
@@ -271,6 +241,24 @@ update test snapshots
 - **Aliases**: `t`
 
 run all tests
+
+## `test-tool-retry`
+
+- **Usage**: `test-tool-retry [--grace-period] <tools>…`
+
+Retry failed test-tools with grace period for recent upstream releases
+
+### Arguments
+
+#### `<tools>…`
+
+Failed tools to retry
+
+### Flags
+
+#### `--grace-period`
+
+Ignore failures from tools whose upstream released &lt;7 days ago
 
 ## `test:build-perf-workspace`
 

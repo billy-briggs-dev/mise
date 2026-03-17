@@ -12,8 +12,10 @@ mise plugins have access to a comprehensive set of built-in Lua modules that pro
 - **`file`** - File system operations
 - **`env`** - Environment variable operations
 - **`strings`** - String manipulation utilities
+- **`semver`** - Semantic version comparison and sorting
 - **`html`** - HTML parsing and manipulation
 - **`archiver`** - Archive extraction
+- **`log`** - Structured logging
 
 ## HTTP Module
 
@@ -185,13 +187,116 @@ local strings = require("strings")
 local function normalize_version(version)
     -- Remove 'v' prefix if present
     version = strings.trim_prefix(version, "v")
-    
+
     -- Remove pre-release suffixes
     local parts = strings.split(version, "-")
     return parts[1]
 end
 
 local version = normalize_version("v1.2.3-beta.1")  -- "1.2.3"
+```
+
+## Semver Module
+
+The semver module provides semantic version comparison and sorting functionality. This is useful for sorting version lists returned by `Available()` hooks.
+
+### Version Comparison
+
+```lua
+local semver = require("semver")
+
+-- Compare two versions
+-- Returns: -1 if v1 < v2, 0 if equal, 1 if v1 > v2
+local result = semver.compare("1.2.3", "1.2.4")  -- -1
+local result = semver.compare("2.0.0", "1.9.9")  -- 1
+local result = semver.compare("1.0.0", "1.0.0")  -- 0
+
+-- Handles numeric comparison correctly
+local result = semver.compare("9.6.9", "9.6.24")   -- -1 (not lexicographic!)
+local result = semver.compare("10.0.0", "9.6.24") -- 1
+```
+
+### Parse Version
+
+```lua
+local semver = require("semver")
+
+-- Parse version string into numeric parts
+local parts = semver.parse("1.2.3")
+print(parts[1])  -- 1
+print(parts[2])  -- 2
+print(parts[3])  -- 3
+
+-- Works with prefixes and suffixes
+local parts = semver.parse("v1.2.3-beta")  -- {1, 2, 3}
+```
+
+### Sort Version Strings
+
+```lua
+local semver = require("semver")
+
+-- Sort array of version strings (ascending order)
+local versions = {"1.10.0", "1.2.0", "1.9.0", "2.0.0"}
+local sorted = semver.sort(versions)
+-- Result: {"1.2.0", "1.9.0", "1.10.0", "2.0.0"}
+```
+
+### Sort Tables by Version Field
+
+```lua
+local semver = require("semver")
+
+-- Sort array of tables by a version field (ascending order)
+local releases = {
+    {version = "1.10.0", url = "..."},
+    {version = "1.2.0", url = "..."},
+    {version = "1.9.0", url = "..."},
+}
+local sorted = semver.sort_by(releases, "version")
+-- Result: sorted by version ascending
+```
+
+### Real-World Example: Available Hook
+
+```lua
+local http = require("http")
+local semver = require("semver")
+
+function PLUGIN:Available(ctx)
+    local resp, err = http.get({
+        url = "https://example.com/releases/"
+    })
+
+    if err ~= nil then
+        error("Failed to fetch versions: " .. err)
+    end
+
+    local result = {}
+    -- Parse versions from response...
+    for version in string.gmatch(resp.body, 'v([0-9]+%.[0-9]+%.[0-9]+)') do
+        table.insert(result, {version = version})
+    end
+
+    -- Sort versions semantically (ascending order - oldest first)
+    return semver.sort_by(result, "version")
+end
+```
+
+### Using Compare in Custom Sort
+
+```lua
+local semver = require("semver")
+
+-- Sort with custom comparator (descending order - newest first)
+table.sort(versions, function(a, b)
+    return semver.compare(a.version, b.version) > 0
+end)
+
+-- Sort ascending (oldest first) - default for Available()
+table.sort(versions, function(a, b)
+    return semver.compare(a.version, b.version) < 0
+end)
 ```
 
 ## HTML Module
@@ -258,14 +363,14 @@ function get_github_releases(owner, repo)
     local resp, err = http.get({
         url = "https://github.com/" .. owner .. "/" .. repo .. "/releases"
     })
-    
+
     if err ~= nil then
         error("Failed to fetch releases: " .. err)
     end
-    
+
     local doc = html.parse(resp.body)
     local releases = {}
-    
+
     -- Find all release tags
     local release_elements = doc:find("a[href*='/releases/tag/']")
     for _, element in ipairs(release_elements) do
@@ -278,7 +383,7 @@ function get_github_releases(owner, repo)
             })
         end
     end
-    
+
     return releases
 end
 ```
@@ -324,17 +429,17 @@ function install_from_archive(download_url, install_path)
     local err = http.download_file({
         url = download_url
     }, archive_path)
-    
+
     if err ~= nil then
         error("Download failed: " .. err)
     end
-    
+
     -- Extract to installation directory
     local err = archiver.decompress(archive_path, install_path)
     if err ~= nil then
         error("Extraction failed: " .. err)
     end
-    
+
     -- Clean up archive
     os.remove(archive_path)
 end
@@ -356,11 +461,29 @@ print(full_path)  -- On Unix: /foo/bar/baz.txt, on Windows: \foo\bar\baz.txt
 
 The `file.join_path(...)` function joins any number of path segments using the correct separator for the current operating system. This is the recommended way to construct file paths in cross-platform plugins.
 
+### Read File Contents
+
+```lua
+local file = require("file")
+print(file.read("/path/to/file"))
+```
+
 ### Create Symbolic Links
 
 ```lua
 local file = require("file")
 file.symlink("/path/to/source", "/path/to/new-symlink")
+```
+
+### Check if file exists
+
+```lua
+local file = require("file")
+if file.exists("important_file.txt") then
+    print("File exists")
+else
+    print("File does not exist")
+end
 ```
 
 ## Environment Module
@@ -442,8 +565,33 @@ local result = cmd.exec("npm install package-name", {cwd = "/path/to/project"})
 The options table supports the following keys:
 
 - **`cwd`** (string): Set the working directory for the command
-- **`env`** (table): Set environment variables for the command execution
+- **`env`** (table): Set environment variables for the command execution. These are merged on top of the inherited environment (see below).
 - **`timeout`** (number): Set a timeout for command execution (future feature)
+
+### Environment Inheritance in Env Module Hooks
+
+When `cmd.exec()` is called from environment module hooks (`MiseEnv`, `MisePath`), the command automatically inherits the mise-constructed environment instead of the process environment. This includes environment variables set by preceding directives and `_.path` entries accumulated so far.
+
+When the module directive has `tools = true`, the inherited environment also includes tool installation bin paths. This means mise-managed tools are directly callable:
+
+```toml
+[env]
+_.my-plugin = { tools = true }
+```
+
+```lua
+function PLUGIN:MiseEnv(ctx)
+    -- With tools=true, mise-managed tools are on PATH
+    local version = cmd.exec("node --version")
+    return {
+        {key = "NODE_VERSION", value = version:gsub("%s+", "")}
+    }
+end
+```
+
+Without `tools = true`, only `_.path` directive entries and the original system PATH are available to `cmd.exec()`.
+
+Any explicit `env` options passed to `cmd.exec()` are merged on top of the inherited environment, allowing selective overrides.
 
 ### Platform-Specific Commands
 
@@ -482,21 +630,21 @@ function fetch_npm_versions(package_name)
             ['User-Agent'] = "mise-plugin"
         }
     })
-    
+
     if err ~= nil then
         error("Failed to fetch package info: " .. err)
     end
-    
+
     local package_info = json.decode(resp.body)
     local versions = {}
-    
+
     for version, _ in pairs(package_info.versions) do
         table.insert(versions, version)
     end
-    
+
     -- Sort versions (simple string sort)
     table.sort(versions)
-    
+
     return versions
 end
 ```
@@ -515,16 +663,16 @@ function download_with_verification(url, dest_path, expected_sha256)
             ['User-Agent'] = "mise-plugin"
         }
     }, dest_path)
-    
+
     if err ~= nil then
         error("Download failed: " .. err)
     end
-    
+
     -- Verify file exists
     if not file.exists(dest_path) then
         error("Downloaded file not found")
     end
-    
+
     -- Note: SHA256 verification would need additional implementation
     -- This is a simplified example
     print("Downloaded successfully to: " .. dest_path)
@@ -542,21 +690,21 @@ function parse_config_file(config_path)
     if not file.exists(config_path) then
         return {}  -- Return empty config
     end
-    
+
     local content = file.read(config_path)
     if not content then
         error("Failed to read config file: " .. config_path)
     end
-    
+
     -- Trim whitespace
     content = strings.trim_space(content)
-    
+
     -- Parse JSON
     local success, config = pcall(json.decode, content)
     if not success then
         error("Invalid JSON in config file: " .. config_path)
     end
-    
+
     return config
 end
 ```
@@ -572,23 +720,23 @@ function scrape_versions_from_releases(base_url)
     local resp, err = http.get({
         url = base_url .. "/releases"
     })
-    
+
     if err ~= nil then
         error("Failed to fetch releases page: " .. err)
     end
-    
+
     local doc = html.parse(resp.body)
     local versions = {}
-    
+
     -- Find version tags
     local version_elements = doc:find("h2 a[href*='/releases/tag/']")
     for _, element in ipairs(version_elements) do
         local version_text = element:text()
         local version = strings.trim_space(version_text)
-        
+
         -- Remove 'v' prefix if present
         version = strings.trim_prefix(version, "v")
-        
+
         if version and version ~= "" then
             table.insert(versions, {
                 version = version,
@@ -596,9 +744,65 @@ function scrape_versions_from_releases(base_url)
             })
         end
     end
-    
+
     return versions
 end
+```
+
+## Log Module
+
+The log module provides structured logging that routes through Rust's `log` crate, respecting `MISE_DEBUG` and `MISE_TRACE` environment variables.
+
+### Log Levels
+
+```lua
+local log = require("log")
+
+log.trace("detailed tracing info")   -- only visible with MISE_TRACE=1
+log.debug("debugging info")          -- visible with MISE_DEBUG=1
+log.info("status message")           -- visible by default
+log.warn("warning message")          -- visible by default
+log.error("error message")           -- visible by default
+```
+
+### Variadic Arguments
+
+All log functions accept multiple arguments of any type. Arguments are converted to strings via `tostring()` and joined with tab characters (`\t`), matching Lua's `print()` behavior:
+
+```lua
+log.info("version", version, "installed to", path)
+-- Output: [plugin-name] version<TAB>1.0.0<TAB>installed to<TAB>/path
+```
+
+### Plugin Name Prefix
+
+All log messages are automatically prefixed with `[plugin_name]`:
+
+```
+mise [INFO] [my-plugin] Installing version 1.0.0
+```
+
+### Print Override
+
+`print()` is overridden to route through `info!()` level logging. This means:
+
+- `print()` output goes to stderr instead of stdout
+- Messages are prefixed with `[plugin_name]`
+- Output respects log level filtering
+
+```lua
+-- These are equivalent:
+print("hello", "world")
+log.info("hello", "world")
+```
+
+### Accessing via vfox Namespace
+
+The log module is also available as `vfox.log`:
+
+```lua
+local log = require("vfox").log
+log.info("message")
 ```
 
 ## Best Practices
@@ -613,20 +817,20 @@ local json = require("json")
 
 function safe_api_call(url)
     local resp, err = http.get({url = url})
-    
+
     if err ~= nil then
         error("HTTP request failed: " .. err)
     end
-    
+
     if resp.status_code ~= 200 then
         error("API returned error: " .. resp.status_code .. " " .. resp.body)
     end
-    
+
     local success, data = pcall(json.decode, resp.body)
     if not success then
         error("Failed to parse JSON response: " .. data)
     end
-    
+
     return data
 end
 ```
@@ -642,26 +846,26 @@ local cache_ttl = 3600  -- 1 hour
 function cached_http_get(url)
     local now = os.time()
     local cache_key = url
-    
+
     -- Check cache
     if cache[cache_key] and (now - cache[cache_key].timestamp) < cache_ttl then
         return cache[cache_key].data
     end
-    
+
     -- Fetch fresh data
     local http = require("http")
     local resp, err = http.get({url = url})
-    
+
     if err ~= nil then
         error("HTTP request failed: " .. err)
     end
-    
+
     -- Cache the result
     cache[cache_key] = {
         data = resp,
         timestamp = now
     }
-    
+
     return resp
 end
 ```
@@ -674,7 +878,7 @@ Handle cross-platform differences:
 local function get_platform_info()
     local is_windows = package.config:sub(1,1) == '\\'
     local cmd = require("cmd")
-    
+
     if is_windows then
         return {
             os = "windows",
@@ -685,7 +889,7 @@ local function get_platform_info()
     else
         local uname = cmd.exec("uname -s"):lower()
         local arch = cmd.exec("uname -m")
-        
+
         return {
             os = uname,
             arch = arch,

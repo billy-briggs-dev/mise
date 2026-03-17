@@ -1,63 +1,62 @@
 #![allow(unknown_lints)]
 #![allow(clippy::literal_string_with_formatting_args)]
 
-use std::sync::Mutex;
-use std::time::Duration;
+use std::{
+    fmt::{Display, Formatter},
+    sync::{Arc, Mutex},
+};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use clx::progress::{ProgressJob, ProgressJobBuilder, ProgressStatus};
 use std::sync::LazyLock as Lazy;
 
 use crate::ui::style;
-use crate::{backend, env, ui};
+use crate::{backend, ui};
 
-pub trait SingleReport: Send + Sync {
+#[derive(Debug, Clone, Copy)]
+pub enum ProgressIcon {
+    Success,
+    Skipped,
+    Warning,
+    Error,
+}
+
+impl Display for ProgressIcon {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProgressIcon::Success => write!(f, "{}", style::egreen("✓").bright()),
+            ProgressIcon::Skipped => write!(f, "{}", style::eyellow("⇢").bright()),
+            ProgressIcon::Warning => write!(f, "{}", style::eyellow("⚠").bright()),
+            ProgressIcon::Error => write!(f, "{}", style::ered("✗").bright()),
+        }
+    }
+}
+
+pub trait SingleReport: Send + Sync + std::fmt::Debug {
     fn println(&self, _message: String) {}
     fn set_message(&self, _message: String) {}
     fn inc(&self, _delta: u64) {}
     fn set_position(&self, _delta: u64) {}
     fn set_length(&self, _length: u64) {}
     fn abandon(&self) {}
-    fn finish(&self) {}
-    fn finish_with_message(&self, _message: String) {}
-}
+    fn finish(&self) {
+        self.finish_with_message(String::new());
+    }
+    fn finish_with_message(&self, message: String) {
+        self.finish_with_icon(message, ProgressIcon::Success);
+    }
+    fn finish_with_icon(&self, _message: String, _icon: ProgressIcon) {}
 
-static SPIN_TEMPLATE: Lazy<ProgressStyle> = Lazy::new(|| {
-    let tmpl = "{prefix} {wide_msg} {spinner:.blue} {elapsed:>3.dim.italic}";
-    ProgressStyle::with_template(tmpl).unwrap()
-});
+    /// Declare how many operations this progress report will have
+    /// Each operation will get equal space (1/count)
+    /// For example, if there are 3 operations (download, checksum, extract):
+    /// - start_operations(3) at the beginning
+    ///
+    /// Then each set_length() call will allocate 33.33% of the total progress
+    fn start_operations(&self, _count: usize) {}
 
-const TICK_INTERVAL: Duration = Duration::from_millis(250);
-
-static PROG_TEMPLATE: Lazy<ProgressStyle> = Lazy::new(|| {
-    let tmpl = match *env::TERM_WIDTH {
-        0..=89 => "{prefix} {wide_msg} {bar:10.cyan/blue} {percent:>2}%",
-        90..=99 => "{prefix} {wide_msg} {bar:15.cyan/blue} {percent:>2}%",
-        100..=114 => "{prefix} {wide_msg} {bytes}/{total_bytes:10} {bar:10.cyan/blue}",
-        _ => {
-            "{prefix} {wide_msg} {bytes}/{total_bytes} ({eta}) {bar:20.cyan/blue} {elapsed:>3.dim.italic}"
-        }
-    };
-    ProgressStyle::with_template(tmpl).unwrap()
-});
-
-static SUCCESS_TEMPLATE: Lazy<ProgressStyle> = Lazy::new(|| {
-    let tmpl = format!("{{prefix}} {} {{wide_msg}}", style::egreen("✓").bright());
-    ProgressStyle::with_template(tmpl.as_str()).unwrap()
-});
-
-static HEADER_TEMPLATE: Lazy<ProgressStyle> = Lazy::new(|| {
-    let width = match *env::TERM_WIDTH {
-        0..=79 => 10,
-        80..=99 => 15,
-        _ => 20,
-    };
-    let tmpl = format!(r#"{{prefix}} {{bar:{width}.cyan/blue}} {{pos}}/{{len:2}}"#);
-    ProgressStyle::with_template(&tmpl).unwrap()
-});
-
-#[derive(Debug)]
-pub struct ProgressReport {
-    pub pb: ProgressBar,
+    /// Advance to the next operation
+    /// Call this before each new stage (after the first one)
+    fn next_operation(&self) {}
 }
 
 static LONGEST_PLUGIN_NAME: Lazy<usize> = Lazy::new(|| {
@@ -74,62 +73,84 @@ fn pad_prefix(w: usize, s: &str) -> String {
 }
 
 fn normal_prefix(pad: usize, prefix: &str) -> String {
-    let prefix = format!("{} {prefix}", style::edim("mise"));
-    pad_prefix(pad, &prefix)
+    pad_prefix(pad, prefix)
+}
+
+/// clx-based progress report implementation
+#[derive(Debug)]
+pub struct ProgressReport {
+    job: Arc<ProgressJob>,
 }
 
 impl ProgressReport {
     pub fn new(prefix: String) -> ProgressReport {
         ui::ctrlc::show_cursor_after_ctrl_c();
         let pad = *LONGEST_PLUGIN_NAME;
-        let pb = ProgressBar::new(100)
-            .with_style(SPIN_TEMPLATE.clone())
-            .with_prefix(normal_prefix(pad, &prefix));
-        pb.enable_steady_tick(TICK_INTERVAL);
-        ProgressReport { pb }
+        let formatted_prefix = normal_prefix(pad, &prefix);
+
+        // Template: prefix + message + optional bytes/progress bar + spinner on right
+        // Use flex_fill to pad message and push progress bar to right edge
+        // Use "arc" spinner style instead of default mini_dot
+        // clx's bytes() function shows actual byte values for the current operation
+        // while clx handles the multi-operation mapping internally for OSC progress
+        // Use bytes(total=false, hide_complete=true) to show only current bytes and hide on completion
+        let body = "{{ prefix }} {{ message | flex_fill }} {% if total %}{{ bytes(total=false, hide_complete=true) }} {{ eta(hide_complete=true) }} {{ progress_bar(width=20, hide_complete=true) }} {% endif %}{{ spinner(name=\"arc\") }}";
+
+        let job = ProgressJobBuilder::new()
+            .body(body)
+            .prop("prefix", &formatted_prefix)
+            .prop("message", "")
+            .start();
+
+        ProgressReport { job }
     }
 }
 
 impl SingleReport for ProgressReport {
     fn println(&self, message: String) {
-        self.pb.suspend(|| {
-            eprintln!("{message}");
-        });
+        self.job.println(&message);
     }
+
     fn set_message(&self, message: String) {
-        self.pb.set_message(message.replace('\r', ""));
+        self.job.prop("message", &message.replace('\r', ""));
     }
+
     fn inc(&self, delta: u64) {
-        self.pb.inc(delta);
-        if Some(self.pb.position()) == self.pb.length() {
-            self.pb.set_style(SPIN_TEMPLATE.clone());
-            self.pb.enable_steady_tick(TICK_INTERVAL);
-        }
+        self.job.increment(delta as usize);
     }
+
     fn set_position(&self, pos: u64) {
-        self.pb.set_position(pos);
-        if Some(self.pb.position()) == self.pb.length() {
-            self.pb.set_style(SPIN_TEMPLATE.clone());
-            self.pb.enable_steady_tick(Duration::from_millis(250));
+        self.job.progress_current(pos as usize);
+    }
+
+    fn set_length(&self, length: u64) {
+        self.job.progress_total(length as usize);
+    }
+
+    fn abandon(&self) {
+        self.job.set_status(ProgressStatus::Hide);
+    }
+
+    fn finish_with_icon(&self, _message: String, icon: ProgressIcon) {
+        // Set status based on icon
+        match icon {
+            ProgressIcon::Success => self.job.set_status(ProgressStatus::Done),
+            ProgressIcon::Error => self.job.set_status(ProgressStatus::Failed),
+            ProgressIcon::Warning => self.job.set_status(ProgressStatus::Warn),
+            ProgressIcon::Skipped => self.job.set_status(ProgressStatus::Done),
         }
     }
-    fn set_length(&self, length: u64) {
-        self.pb.set_position(0);
-        self.pb.set_style(PROG_TEMPLATE.clone());
-        self.pb.disable_steady_tick();
-        self.pb.set_length(length);
+
+    fn start_operations(&self, count: usize) {
+        self.job.start_operations(count);
     }
-    fn abandon(&self) {
-        self.pb.abandon();
-    }
-    fn finish(&self) {
-        self.pb.finish_and_clear();
-    }
-    fn finish_with_message(&self, _message: String) {
-        self.pb.finish_and_clear();
+
+    fn next_operation(&self) {
+        self.job.next_operation();
     }
 }
 
+#[derive(Debug)]
 pub struct QuietReport {}
 
 impl QuietReport {
@@ -140,10 +161,13 @@ impl QuietReport {
 
 impl SingleReport for QuietReport {}
 
+#[derive(Debug)]
 pub struct VerboseReport {
     prefix: String,
     prev_message: Mutex<String>,
     pad: usize,
+    total_operations: Mutex<Option<usize>>,
+    current_operation: Mutex<usize>,
 }
 
 impl VerboseReport {
@@ -152,6 +176,8 @@ impl VerboseReport {
             prefix,
             prev_message: Mutex::new("".to_string()),
             pad: *LONGEST_PLUGIN_NAME,
+            total_operations: Mutex::new(None),
+            current_operation: Mutex::new(0),
         }
     }
 }
@@ -165,72 +191,34 @@ impl SingleReport for VerboseReport {
         if *prev_message == message {
             return;
         }
+        let total = *self.total_operations.lock().unwrap();
+        let current = *self.current_operation.lock().unwrap();
+        let formatted = if let Some(total) = total {
+            format!("[{}/{}] {}", current, total, message)
+        } else {
+            message.clone()
+        };
         let prefix = pad_prefix(self.pad, &self.prefix);
-        log::info!("{prefix} {message}");
-        *prev_message = message.clone();
+        log::info!("{prefix} {formatted}");
+        *prev_message = message;
     }
     fn finish(&self) {
         self.finish_with_message(style::egreen("done").to_string());
     }
-    fn finish_with_message(&self, message: String) {
+    fn finish_with_icon(&self, message: String, icon: ProgressIcon) {
         let prefix = pad_prefix(self.pad - 2, &self.prefix);
-        let ico = style::egreen("✓").bright();
-        log::info!("{prefix} {ico} {message}");
+        log::info!("{prefix} {icon} {message}");
     }
-}
-
-#[derive(Debug)]
-pub struct HeaderReport {
-    pub pb: ProgressBar,
-}
-
-impl HeaderReport {
-    pub fn new(prefix: String, length: u64, message: String) -> HeaderReport {
-        ui::ctrlc::show_cursor_after_ctrl_c();
-        let pb = ProgressBar::new(length)
-            .with_style(HEADER_TEMPLATE.clone())
-            .with_prefix(prefix)
-            .with_message(message)
-            .with_position(0);
-        pb.enable_steady_tick(TICK_INTERVAL);
-        HeaderReport { pb }
+    fn start_operations(&self, count: usize) {
+        *self.total_operations.lock().unwrap() = Some(count.max(1));
+        *self.current_operation.lock().unwrap() = 1;
     }
-}
-
-impl SingleReport for HeaderReport {
-    fn println(&self, message: String) {
-        self.pb.suspend(|| {
-            eprintln!("{message}");
-        });
-    }
-    fn set_message(&self, message: String) {
-        self.pb.set_message(message.replace('\r', ""));
-    }
-    fn inc(&self, delta: u64) {
-        self.pb.inc(delta);
-    }
-    fn set_position(&self, pos: u64) {
-        self.pb.set_position(pos);
-        if Some(self.pb.position()) == self.pb.length() {
-            self.pb.set_style(SPIN_TEMPLATE.clone());
-            self.pb.enable_steady_tick(Duration::from_millis(250));
+    fn next_operation(&self) {
+        let total = *self.total_operations.lock().unwrap();
+        if total.is_some() {
+            let mut current = self.current_operation.lock().unwrap();
+            *current += 1;
         }
-    }
-    fn set_length(&self, length: u64) {
-        self.pb.set_position(0);
-        self.pb.set_style(HEADER_TEMPLATE.clone());
-        self.pb.set_length(length);
-    }
-    fn abandon(&self) {
-        self.pb.abandon();
-    }
-    fn finish(&self) {
-        self.pb.set_style(SUCCESS_TEMPLATE.clone());
-        self.pb.finish()
-    }
-    fn finish_with_message(&self, message: String) {
-        self.pb.set_style(SUCCESS_TEMPLATE.clone());
-        self.pb.finish_with_message(message);
     }
 }
 

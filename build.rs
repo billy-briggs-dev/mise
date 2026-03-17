@@ -1,6 +1,6 @@
 use heck::ToUpperCamelCase;
 use indexmap::IndexMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::{env, fs};
 
 fn main() {
@@ -14,21 +14,103 @@ fn main() {
 
     codegen_settings();
     codegen_registry();
-    codegen_aqua();
+}
+
+/// Generate a raw string literal that safely contains the given content.
+/// Dynamically determines the minimum number of '#' needed.
+fn raw_string_literal(s: &str) -> String {
+    // Find the longest sequence of '#' characters following a '"' in the string
+    let mut max_hashes = 0;
+    let mut current_hashes = 0;
+    let mut after_quote = false;
+
+    for c in s.chars() {
+        if after_quote {
+            if c == '#' {
+                current_hashes += 1;
+                max_hashes = max_hashes.max(current_hashes);
+            } else {
+                after_quote = false;
+                current_hashes = 0;
+            }
+        }
+        if c == '"' {
+            after_quote = true;
+            current_hashes = 0;
+        }
+    }
+
+    // Use one more '#' than the longest sequence found
+    let hashes = "#".repeat(max_hashes + 1);
+    format!("r{hashes}\"{s}\"{hashes}")
+}
+
+/// Parse options from a TOML value into a Vec of (key, value) pairs
+fn parse_options(opts: Option<&toml::Value>) -> Vec<(String, String)> {
+    opts.map(|opts| {
+        if let Some(table) = opts.as_table() {
+            table
+                .iter()
+                .map(|(k, v)| {
+                    let value = match v {
+                        toml::Value::String(s) => s.clone(),
+                        toml::Value::Table(t) => {
+                            // Serialize nested tables back to TOML string
+                            toml::to_string(t).unwrap_or_default()
+                        }
+                        _ => v.to_string(),
+                    };
+                    (k.clone(), value)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        }
+    })
+    .unwrap_or_default()
+}
+
+fn load_registry_tools() -> toml::map::Map<String, toml::Value> {
+    let mut tools = toml::map::Map::new();
+    let registry_dir = Path::new("registry");
+
+    println!("cargo:rerun-if-changed=registry");
+
+    let mut files: Vec<_> = fs::read_dir(registry_dir)
+        .expect("registry directory not found")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+        .collect();
+    files.sort();
+
+    for file in files {
+        println!("cargo:rerun-if-changed={}", file.display());
+        let tool_name = file
+            .file_stem()
+            .expect("file has no stem")
+            .to_str()
+            .expect("filename is not valid UTF-8")
+            .to_string();
+        let content = fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {}", file.display(), e));
+        let tool_info: toml::Value = toml::de::from_str(&content)
+            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", file.display(), e));
+        tools.insert(tool_name, tool_info);
+    }
+    tools
 }
 
 fn codegen_registry() {
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("registry.rs");
-    let mut lines = vec!["[".to_string()];
+    let mut lines = vec![
+        "{".to_string(),
+        "    let mut m = std::collections::BTreeMap::new();".to_string(),
+    ];
 
-    let registry: toml::Table = fs::read_to_string("registry.toml")
-        .unwrap()
-        .parse()
-        .unwrap();
-
-    let tools = registry.get("tools").unwrap().as_table().unwrap();
-    for (short, info) in tools {
+    let tools = load_registry_tools();
+    for (short, info) in &tools {
         let info = info.as_table().unwrap();
         let aliases = info
             .get("aliases")
@@ -40,11 +122,20 @@ fn codegen_registry() {
             .map(|v| v.as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         let test = info.get("test").map(|t| {
-            let t = t.as_array().unwrap();
-            (
-                t[0].as_str().unwrap().to_string(),
-                t[1].as_str().unwrap().to_string(),
-            )
+            let t = t
+                .as_table()
+                .unwrap_or_else(|| panic!("[{short}] 'test' field must be a table"));
+            let cmd = t
+                .get("cmd")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("[{short}] 'test.cmd' must be a string"))
+                .to_string();
+            let expected = t
+                .get("expected")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("[{short}] 'test.expected' must be a string"))
+                .to_string();
+            (cmd, expected)
         });
         let mut backends = vec![];
         for backend in info.get("backends").unwrap().as_array().unwrap() {
@@ -54,6 +145,7 @@ fn codegen_registry() {
                         r##"RegistryBackend{{
                             full: r#"{backend}"#,
                             platforms: &[],
+                            options: &[],
                         }}"##
                     ));
                 }
@@ -69,14 +161,25 @@ fn codegen_registry() {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
+                    let backend_options = parse_options(backend.get("options"));
                     backends.push(format!(
                         r##"RegistryBackend{{
                             full: r#"{full}"#,
                             platforms: &[{platforms}],
+                            options: &[{options}],
                         }}"##,
                         platforms = platforms
                             .into_iter()
                             .map(|p| format!("\"{p}\""))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        options = backend_options
+                            .iter()
+                            .map(|(k, v)| format!(
+                                "({}, {})",
+                                raw_string_literal(k),
+                                raw_string_literal(v)
+                            ))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
@@ -122,10 +225,32 @@ fn codegen_registry() {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let detect = info
+            .get("detect")
+            .map(|detect| {
+                detect
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|f| f.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let overrides = info
+            .get("overrides")
+            .map(|overrides| {
+                overrides
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|f| f.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let rt = format!(
-            r#"RegistryTool{{short: "{short}", description: {description}, backends: &[{backends}], aliases: &[{aliases}], test: &{test}, os: &[{os}], depends: &[{depends}], idiomatic_files: &[{idiomatic_files}]}}"#,
+            r#"RegistryTool{{short: "{short}", description: {description}, backends: &[{backends}], aliases: &[{aliases}], test: &{test}, os: &[{os}], depends: &[{depends}], idiomatic_files: &[{idiomatic_files}], detect: &[{detect}], overrides: &[{overrides}]}}"#,
             description = description
-                .map(|d| format!("Some(r###\"{d}\"###)"))
+                .map(|d| format!("Some({})", raw_string_literal(&d)))
                 .unwrap_or("None".to_string()),
             backends = backends.into_iter().collect::<Vec<_>>().join(", "),
             aliases = aliases
@@ -134,7 +259,11 @@ fn codegen_registry() {
                 .collect::<Vec<_>>()
                 .join(", "),
             test = test
-                .map(|(t, v)| format!("Some((r\"{t}\", r\"{v}\"))"))
+                .map(|(t, v)| format!(
+                    "Some(({}, {}))",
+                    raw_string_literal(&t),
+                    raw_string_literal(&v)
+                ))
                 .unwrap_or("None".to_string()),
             os = os
                 .iter()
@@ -151,13 +280,24 @@ fn codegen_registry() {
                 .map(|f| format!("\"{f}\""))
                 .collect::<Vec<_>>()
                 .join(", "),
+            detect = detect
+                .iter()
+                .map(|f| format!("\"{f}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            overrides = overrides
+                .iter()
+                .map(|f| format!("\"{f}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
-        lines.push(format!(r#"    ("{short}", {rt}),"#));
+        lines.push(format!(r#"    m.insert("{short}", {rt});"#));
         for alias in aliases {
-            lines.push(format!(r#"    ("{alias}", {rt}),"#));
+            lines.push(format!(r#"    m.insert("{alias}", {rt});"#));
         }
     }
-    lines.push(r#"].into()"#.to_string());
+    lines.push("    m".to_string());
+    lines.push("}".to_string());
 
     fs::write(&dest_path, lines.join("\n")).unwrap();
 }
@@ -172,10 +312,10 @@ pub struct Settings {"#
             .to_string(),
     ];
 
-    let settings: toml::Table = fs::read_to_string("settings.toml")
-        .unwrap()
-        .parse()
-        .unwrap();
+    println!("cargo:rerun-if-changed=settings.toml");
+    let settings_toml = fs::read_to_string("settings.toml").expect("Failed to read settings.toml");
+    let settings: toml::Table =
+        toml::de::from_str(&settings_toml).expect("Failed to parse settings.toml");
     let props_to_code = |key: &str, props: &toml::Value| {
         let mut lines = vec![];
         let props = props.as_table().unwrap();
@@ -185,18 +325,24 @@ pub struct Settings {"#
         let type_ = props
             .get("rust_type")
             .map(|rt| rt.as_str().unwrap())
-            .or(props.get("type").map(|t| match t.as_str().unwrap() {
-                "Bool" => "bool",
-                "String" => "String",
-                "Integer" => "i64",
-                "Url" => "String",
-                "Path" => "PathBuf",
-                "Duration" => "String",
-                "ListString" => "Vec<String>",
-                "ListPath" => "Vec<PathBuf>",
-                "SetString" => "BTreeSet<String>",
-                t => panic!("Unknown type: {t}"),
-            }));
+            .or_else(|| {
+                props.get("type").map(|t| match t.as_str().unwrap() {
+                    "Bool" => "bool",
+                    "String" => "String",
+                    "Integer" => "i64",
+                    "Url" => "String",
+                    "Path" => "PathBuf",
+                    "Duration" => "String",
+                    "ListString" => "Vec<String>",
+                    "ListPath" => "Vec<PathBuf>",
+                    "SetString" => "BTreeSet<String>",
+                    "IndexMap<String, String>" => "IndexMap<String, String>",
+                    "BoolOrString" => {
+                        panic!(r#"type \"BoolOrString\" requires a `rust_type` to be specified"#)
+                    }
+                    t => panic!("Unknown type: {t}"),
+                })
+            });
         if let Some(type_) = type_ {
             let type_ = if props.get("optional").is_some_and(|v| v.as_bool().unwrap()) {
                 format!("Option<{type_}>")
@@ -273,19 +419,53 @@ pub static SETTINGS_META: Lazy<IndexMap<&'static str, SettingsMeta>> = Lazy::new
     indexmap!{"#
             .to_string(),
     );
+    let push_deprecated_fields = |lines: &mut Vec<String>, props: &toml::Table| {
+        let deprecated = props
+            .get("deprecated")
+            .map(|v| v.as_str().unwrap().to_string());
+        let warn_at = props
+            .get("deprecated_warn_at")
+            .map(|v| v.as_str().unwrap().to_string());
+        let remove_at = props
+            .get("deprecated_remove_at")
+            .map(|v| v.as_str().unwrap().to_string());
+        match deprecated {
+            Some(msg) => lines.push(format!(
+                "        deprecated: Some({}),",
+                raw_string_literal(&msg)
+            )),
+            None => lines.push("        deprecated: None,".to_string()),
+        }
+        match warn_at {
+            Some(v) => lines.push(format!("        deprecated_warn_at: Some({v:?}),")),
+            None => lines.push("        deprecated_warn_at: None,".to_string()),
+        }
+        match remove_at {
+            Some(v) => lines.push(format!("        deprecated_remove_at: Some({v:?}),")),
+            None => lines.push("        deprecated_remove_at: None,".to_string()),
+        }
+    };
     for (name, props) in &settings {
         let props = props.as_table().unwrap();
         if let Some(type_) = props.get("type").map(|v| v.as_str().unwrap()) {
+            // We could shadow the 'type_' variable, but its a best practice to avoid shadowing.
+            // Thus, we introduce 'meta_type' here.
+            let meta_type = match type_ {
+                "IndexMap<String, String>" => "IndexMap",
+                other => other,
+            };
             lines.push(format!(
                 r#"    "{name}" => SettingsMeta {{
-        type_: SettingsType::{type_},"#,
+        type_: SettingsType::{meta_type},"#,
             ));
             if let Some(description) = props.get("description") {
                 let description = description.as_str().unwrap().to_string();
                 lines.push(format!(
-                    r####"        description: r###"{description}"###,"####
+                    "        description: {},",
+                    raw_string_literal(&description)
                 ));
             }
+            push_deprecated_fields(&mut lines, props);
             lines.push("    },".to_string());
         }
     }
@@ -293,17 +473,25 @@ pub static SETTINGS_META: Lazy<IndexMap<&'static str, SettingsMeta>> = Lazy::new
         for (key, props) in props.as_table().unwrap() {
             let props = props.as_table().unwrap();
             if let Some(type_) = props.get("type").map(|v| v.as_str().unwrap()) {
+                // We could shadow the 'type_' variable, but its a best practice to avoid shadowing.
+                // Thus, we introduce 'meta_type' here.
+                let meta_type = match type_ {
+                    "IndexMap<String, String>" => "IndexMap",
+                    other => other,
+                };
                 lines.push(format!(
                     r#"    "{name}.{key}" => SettingsMeta {{
-        type_: SettingsType::{type_},"#,
+        type_: SettingsType::{meta_type},"#,
                 ));
             }
             if let Some(description) = props.get("description") {
                 let description = description.as_str().unwrap().to_string();
                 lines.push(format!(
-                    r####"        description: r###"{description}"###,"####
+                    "        description: {},",
+                    raw_string_literal(&description)
                 ));
             }
+            push_deprecated_fields(&mut lines, props);
             lines.push("    },".to_string());
         }
     }
@@ -314,54 +502,56 @@ pub static SETTINGS_META: Lazy<IndexMap<&'static str, SettingsMeta>> = Lazy::new
         .to_string(),
     );
 
-    fs::write(&dest_path, lines.join("\n")).unwrap();
-}
+    // Generate MisercSettings struct for early initialization settings
+    lines.push(
+        r#"
+/// Settings that can be set in .miserc.toml for early initialization.
+/// These settings affect config file discovery and must be loaded before
+/// the main config files are parsed.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct MisercSettings {"#
+            .to_string(),
+    );
 
-// pub static AQUA_STANDARD_REGISTRY_FILES: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
-//     include!(concat!(env!("OUT_DIR"), "/aqua_standard_registry.rs"));
-// });
-
-fn codegen_aqua() {
-    let out_dir = env::var_os("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("aqua_standard_registry.rs");
-    let mut lines = vec!["[".to_string()];
-    for (k, v) in aqua_registries(&registry_dir()).unwrap_or_default() {
-        lines.push(format!(r####"    ("{k}", r###"{v}"###),"####));
-    }
-    lines.push("].into()".to_string());
-    fs::write(&dest_path, lines.join("\n")).unwrap();
-}
-
-fn ls(path: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
-    fs::read_dir(path)?
-        .map(|entry| entry.map(|e| e.path()))
-        .collect()
-}
-
-fn aqua_registries(d: &Path) -> Result<Vec<(String, String)>, std::io::Error> {
-    let mut registries = vec![];
-    for f in ls(d)? {
-        if f.is_dir() {
-            registries.extend(aqua_registries(&f)?);
-        } else if f.file_name() == Some("registry.yaml".as_ref()) {
-            registries.push((
-                f.parent()
-                    .unwrap()
-                    .strip_prefix(registry_dir())
-                    .unwrap()
-                    .to_string_lossy()
-                    .split(std::path::MAIN_SEPARATOR_STR)
-                    .collect::<Vec<_>>()
-                    .join("/"),
-                fs::read_to_string(&f).unwrap(),
-            ));
+    for (key, props) in &settings {
+        let props = props.as_table().unwrap();
+        // Only include settings with rc = true
+        if props
+            .get("rc")
+            .is_some_and(|v| v.as_bool().unwrap_or(false))
+        {
+            if let Some(description) = props.get("description") {
+                lines.push(format!("    /// {}", description.as_str().unwrap()));
+            }
+            let type_ = props
+                .get("rust_type")
+                .map(|rt| rt.as_str().unwrap())
+                .or_else(|| {
+                    props.get("type").map(|t| match t.as_str().unwrap() {
+                        "Bool" => "bool",
+                        "String" => "String",
+                        "Integer" => "i64",
+                        "Url" => "String",
+                        "Path" => "PathBuf",
+                        "Duration" => "String",
+                        "ListString" => "Vec<String>",
+                        "ListPath" => "Vec<PathBuf>",
+                        "SetString" => "BTreeSet<String>",
+                        "IndexMap<String, String>" => "IndexMap<String, String>",
+                        "BoolOrString" => panic!(
+                            r#"type \"BoolOrString\" requires a `rust_type` to be specified"#
+                        ),
+                        t => panic!("Unknown type: {t}"),
+                    })
+                });
+            if let Some(type_) = type_ {
+                // All miserc settings are optional
+                let type_ = format!("Option<{type_}>");
+                lines.push(format!("    pub {key}: {type_},"));
+            }
         }
     }
-    Ok(registries)
-}
+    lines.push("}".to_string());
 
-fn registry_dir() -> PathBuf {
-    PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap())
-        .join("aqua-registry")
-        .join("pkgs")
+    fs::write(&dest_path, lines.join("\n")).unwrap();
 }

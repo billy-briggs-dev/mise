@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use crate::cli::args::BackendArg;
-use crate::env::RUST_BACKTRACE;
 use crate::file::display_path;
 use crate::toolset::{ToolRequest, ToolSource, ToolVersion};
 use eyre::Report;
@@ -46,30 +45,43 @@ fn format_install_failures(failed_installations: &[(ToolRequest, Report)]) -> St
         return "Installation failed".to_string();
     }
 
-    let mut output = vec![];
-    let failed_tools: Vec<String> = failed_installations
+    // For a single failure, show the underlying error directly to preserve
+    // the original error location for better debugging
+    if failed_installations.len() == 1 {
+        let (tr, error) = &failed_installations[0];
+        // Show the underlying error with the tool context
+        // Use {:#} to show full error chain (includes wrapped errors)
+        return format!(
+            "Failed to install {}@{}: {:#}",
+            tr.ba().full(),
+            tr.version(),
+            error
+        );
+    }
+
+    // For multiple failures, show a summary and then each error
+    // Sort by tool name for deterministic output (parallel installs complete in arbitrary order)
+    let mut sorted_failures: Vec<_> = failed_installations
         .iter()
-        .map(|(tr, _)| format!("{}@{}", tr.ba().short, tr.version()))
+        .map(|(tr, err)| (format!("{}@{}", tr.ba().full(), tr.version()), err))
+        .collect();
+    sorted_failures.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut output = vec![];
+    let failed_tools: Vec<&str> = sorted_failures
+        .iter()
+        .map(|(name, _)| name.as_str())
         .collect();
 
     output.push(format!(
-        "Failed to install {}: {}",
-        if failed_tools.len() == 1 {
-            "tool"
-        } else {
-            "tools"
-        },
+        "Failed to install tools: {}",
         failed_tools.join(", ")
     ));
 
-    // Show detailed errors for each failure
-    for (tr, error) in failed_installations.iter() {
-        let error_str = if *RUST_BACKTRACE {
-            format!("{error}")
-        } else {
-            format!("{error:?}")
-        };
-        output.push(format!("\n{}@{}: {error_str}", tr.ba().short, tr.version()));
+    // Show detailed errors for each failure (in sorted order)
+    // Use {:#} to show full error chain (includes wrapped errors)
+    for (name, error) in sorted_failures.iter() {
+        output.push(format!("\n{}: {:#}", name, error));
     }
 
     output.join("\n")

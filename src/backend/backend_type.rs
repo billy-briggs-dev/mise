@@ -17,8 +17,10 @@ pub enum BackendType {
     Aqua,
     Asdf,
     Cargo,
+    Conda,
     Core,
     Dotnet,
+    Forgejo,
     Gem,
     Github,
     Gitlab,
@@ -27,6 +29,7 @@ pub enum BackendType {
     Pipx,
     Spm,
     Http,
+    S3,
     Ubi,
     Vfox,
     VfoxBackend(String),
@@ -50,8 +53,10 @@ impl BackendType {
             "aqua" => BackendType::Aqua,
             "asdf" => BackendType::Asdf,
             "cargo" => BackendType::Cargo,
+            "conda" => BackendType::Conda,
             "core" => BackendType::Core,
             "dotnet" => BackendType::Dotnet,
+            "forgejo" => BackendType::Forgejo,
             "gem" => BackendType::Gem,
             "github" => BackendType::Github,
             "gitlab" => BackendType::Gitlab,
@@ -60,9 +65,22 @@ impl BackendType {
             "pipx" => BackendType::Pipx,
             "spm" => BackendType::Spm,
             "http" => BackendType::Http,
+            "s3" => BackendType::S3,
             "ubi" => BackendType::Ubi,
             "vfox" => BackendType::Vfox,
             _ => BackendType::Unknown,
+        }
+    }
+
+    /// Returns true if this backend requires experimental mode to be enabled
+    pub fn is_experimental(&self) -> bool {
+        use super::{conda, dotnet, s3, spm};
+        match self {
+            BackendType::Conda => conda::EXPERIMENTAL,
+            BackendType::Dotnet => dotnet::EXPERIMENTAL,
+            BackendType::S3 => s3::EXPERIMENTAL,
+            BackendType::Spm => spm::EXPERIMENTAL,
+            _ => false,
         }
     }
 }

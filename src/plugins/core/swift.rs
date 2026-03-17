@@ -5,7 +5,7 @@ use crate::http::HTTP;
 use crate::install_context::InstallContext;
 use crate::toolset::ToolVersion;
 use crate::ui::progress_report::SingleReport;
-use crate::{backend::Backend, config::Config};
+use crate::{backend::Backend, backend::VersionInfo, config::Config};
 use crate::{file, github, gpg, plugins};
 use async_trait::async_trait;
 use eyre::Result;
@@ -34,12 +34,12 @@ impl SwiftPlugin {
     fn test_swift(&self, ctx: &InstallContext, tv: &ToolVersion) -> Result<()> {
         ctx.pr.set_message("swift --version".into());
         CmdLineRunner::new(self.swift_bin(tv))
-            .with_pr(&ctx.pr)
+            .with_pr(ctx.pr.as_ref())
             .arg("--version")
             .execute()
     }
 
-    async fn download(&self, tv: &ToolVersion, pr: &Box<dyn SingleReport>) -> Result<PathBuf> {
+    async fn download(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<PathBuf> {
         let settings = Settings::get();
         let url = format!(
             "https://download.swift.org/swift-{version}-release/{platform_directory}/swift-{version}-RELEASE/swift-{version}-RELEASE-{platform}{architecture}.{extension}",
@@ -73,11 +73,11 @@ impl SwiftPlugin {
                     .path()
                     .to_path_buf()
             };
-            CmdLineRunner::new("pkgutil")
+            CmdLineRunner::new(pkgutil_path())
                 .arg("--expand-full")
                 .arg(tarball_path)
                 .arg(&tmp)
-                .with_pr(&ctx.pr)
+                .with_pr(ctx.pr.as_ref())
                 .execute()?;
             file::remove_all(tv.install_path())?;
             file::rename(
@@ -92,9 +92,9 @@ impl SwiftPlugin {
                 tarball_path,
                 &tv.install_path(),
                 &file::TarOptions {
-                    format: file::TarFormat::TarGz,
-                    pr: Some(&ctx.pr),
                     strip_components: 1,
+                    pr: Some(ctx.pr.as_ref()),
+                    ..file::TarOptions::new(file::TarFormat::TarGz)
                 },
             )?;
         }
@@ -130,7 +130,7 @@ impl SwiftPlugin {
         }
         gpg::add_keys_swift(ctx)?;
         let sig_path = PathBuf::from(format!("{}.sig", tarball_path.to_string_lossy()));
-        HTTP.download_file(format!("{}.sig", url(tv)), &sig_path, Some(&ctx.pr))
+        HTTP.download_file(format!("{}.sig", url(tv)), &sig_path, Some(ctx.pr.as_ref()))
             .await?;
         self.gpg(ctx)
             .arg("--quiet")
@@ -148,7 +148,54 @@ impl SwiftPlugin {
     }
 
     fn gpg<'a>(&self, ctx: &'a InstallContext) -> CmdLineRunner<'a> {
-        CmdLineRunner::new("gpg").with_pr(&ctx.pr)
+        CmdLineRunner::new("gpg").with_pr(ctx.pr.as_ref())
+    }
+}
+
+#[cfg(macos)]
+fn pkgutil_path() -> PathBuf {
+    resolve_pkgutil_path(file::which("pkgutil"))
+}
+
+#[cfg(not(macos))]
+fn pkgutil_path() -> PathBuf {
+    PathBuf::from("pkgutil")
+}
+
+#[cfg(macos)]
+fn resolve_pkgutil_path(which_result: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = which_result {
+        return path;
+    }
+    let fallback = PathBuf::from("/usr/sbin/pkgutil");
+    if file::is_executable(&fallback) {
+        fallback
+    } else {
+        PathBuf::from("pkgutil")
+    }
+}
+
+#[cfg(all(test, macos))]
+mod tests {
+    use super::resolve_pkgutil_path;
+    use crate::file;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolve_pkgutil_path_prefers_discovered_path() {
+        let discovered = PathBuf::from("/tmp/custom/pkgutil");
+        assert_eq!(resolve_pkgutil_path(Some(discovered.clone())), discovered);
+    }
+
+    #[test]
+    fn resolve_pkgutil_path_falls_back_to_system_location() {
+        let resolved = resolve_pkgutil_path(None);
+        let fallback = PathBuf::from("/usr/sbin/pkgutil");
+        if file::is_executable(&fallback) {
+            assert_eq!(resolved, fallback);
+        } else {
+            assert_eq!(resolved, PathBuf::from("pkgutil"));
+        }
     }
 }
 
@@ -158,19 +205,42 @@ impl Backend for SwiftPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
+    async fn security_info(&self) -> Vec<crate::backend::SecurityFeature> {
+        use crate::backend::SecurityFeature;
+
+        let mut features = vec![SecurityFeature::Checksum {
+            algorithm: Some("sha256".to_string()),
+        }];
+
+        // GPG verification is available on Linux when gpg is installed
+        if cfg!(target_os = "linux") && Settings::get().swift.gpg_verify != Some(false) {
+            features.push(SecurityFeature::Gpg);
+        }
+
+        features
+    }
+
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
         let versions = github::list_releases("swiftlang/swift")
             .await?
             .into_iter()
-            .map(|r| r.tag_name)
-            .filter_map(|v| v.strip_prefix("swift-").map(|v| v.to_string()))
-            .filter_map(|v| v.strip_suffix("-RELEASE").map(|v| v.to_string()))
+            .filter_map(|r| {
+                r.tag_name
+                    .strip_prefix("swift-")
+                    .and_then(|v| v.strip_suffix("-RELEASE"))
+                    .map(|v| (v.to_string(), r.created_at))
+            })
             .rev()
+            .map(|(version, created_at)| VersionInfo {
+                version,
+                created_at: Some(created_at),
+                ..Default::default()
+            })
             .collect();
         Ok(versions)
     }
 
-    fn idiomatic_filenames(&self) -> Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
         if Settings::get().experimental {
             Ok(vec![".swift-version".into()])
         } else {
@@ -183,7 +253,7 @@ impl Backend for SwiftPlugin {
         ctx: &InstallContext,
         mut tv: ToolVersion,
     ) -> Result<ToolVersion> {
-        let tarball_path = self.download(&tv, &ctx.pr).await?;
+        let tarball_path = self.download(&tv, ctx.pr.as_ref()).await?;
         if cfg!(target_os = "linux") && Settings::get().swift.gpg_verify != Some(false) {
             self.verify_gpg(ctx, &tv, &tarball_path).await?;
         }
@@ -208,8 +278,8 @@ fn platform_directory() -> String {
     } else if let Ok(os_release) = &*os_release::OS_RELEASE {
         let settings = Settings::get();
         let arch = settings.arch();
-        if os_release.id == "ubuntu" && arch == "aarch64" {
-            let retval = format!("{}{}-{}", os_release.id, os_release.version_id, arch);
+        if os_release.id == "ubuntu" && arch == "arm64" {
+            let retval = format!("{}{}-aarch64", os_release.id, os_release.version_id);
             retval.replace(".", "")
         } else {
             platform().replace(".", "")
@@ -254,8 +324,12 @@ fn extension() -> &'static str {
 
 fn architecture(settings: &Settings) -> Option<&str> {
     let arch = settings.arch();
-    if cfg!(target_os = "linux") && arch != "x64" {
-        return Some(arch);
+    if cfg!(target_os = "linux") {
+        return match arch {
+            "x64" => None,
+            "arm64" => Some("aarch64"),
+            _ => Some(arch),
+        };
     } else if cfg!(windows) && arch == "arm64" {
         return Some("arm64");
     }

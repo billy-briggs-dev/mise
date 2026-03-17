@@ -1,17 +1,20 @@
-use crate::backend::{Backend, VersionCacheManager};
+use crate::backend::platform_target::PlatformTarget;
+use crate::backend::static_helpers::fetch_checksum_from_shasums;
+use crate::backend::{Backend, VersionCacheManager, VersionInfo};
 use crate::build_time::built_info;
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
 use crate::config::{Config, Settings};
-use crate::file::{TarOptions, display_path};
+use crate::file::{TarFormat, TarOptions, display_path};
 use crate::git::{CloneOptions, Git};
 use crate::http::{HTTP, HTTP_FETCH};
 use crate::install_context::InstallContext;
+use crate::lockfile::PlatformInfo;
 use crate::toolset::{ToolRequest, ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
 use crate::{Result, lock_file::LockFile};
-use crate::{cmd, dirs, file, plugins, sysconfig};
+use crate::{dirs, file, plugins, sysconfig};
 use async_trait::async_trait;
 use eyre::{bail, eyre};
 use flate2::read::GzDecoder;
@@ -36,6 +39,51 @@ pub fn python_path(tv: &ToolVersion) -> PathBuf {
     } else {
         tv.install_path().join("bin/python")
     }
+}
+
+/// Sort key for Python versions that handles miniconda's two versioning schemes correctly.
+///
+/// Miniconda has two formats:
+/// - Old format: `miniconda3-{conda_version}` (e.g., `miniconda3-3.16.0`, `miniconda3-4.7.12`)
+/// - New format: `miniconda3-{python_version}-{conda_version}` (e.g., `miniconda3-3.7-4.8.2`)
+///
+/// Returns a tuple for sorting: (distro_priority, prefix_order, is_not_latest, conda_version, python_version)
+/// distro_priority: 0 = other distros, 1 = miniconda, 2 = CPython (bare version numbers)
+fn python_version_sort_key(
+    version: &str,
+) -> (u8, u8, bool, Option<Versioning>, Option<Versioning>) {
+    // Check if this is a miniconda version and get prefix order
+    let (prefix_order, version_part) = if let Some(v) = version.strip_prefix("miniconda3-") {
+        (2u8, v)
+    } else if let Some(v) = version.strip_prefix("miniconda2-") {
+        (1u8, v)
+    } else if let Some(v) = version.strip_prefix("miniconda-") {
+        (0u8, v)
+    } else {
+        // Not miniconda - put other distros first (0), CPython (digit-starting) last (2)
+        let starts_with_digit = regex!(r"^\d").is_match(version);
+        return (if starts_with_digit { 2 } else { 0 }, 0, false, None, None);
+    };
+
+    // Handle "latest" specially - put first in each miniconda group
+    if version_part == "latest" {
+        return (1, prefix_order, false, None, None);
+    }
+
+    // Parse miniconda version: old format vs new format
+    // Old format has no dash in version part: "3.16.0"
+    // New format has dash separating python and conda: "3.7-4.8.2"
+    let (conda_version, python_version) = if let Some(dash_pos) = version_part.find('-') {
+        // New format: "3.7-4.8.2" -> python=3.7, conda=4.8.2
+        let python = &version_part[..dash_pos];
+        let conda = &version_part[dash_pos + 1..];
+        (Versioning::new(conda), Versioning::new(python))
+    } else {
+        // Old format: "3.16.0" -> conda=3.16.0, no python version
+        (Versioning::new(version_part), None)
+    };
+
+    (1, prefix_order, true, conda_version, python_version)
 }
 
 impl PythonPlugin {
@@ -76,7 +124,7 @@ impl PythonPlugin {
         file::remove_all(&python_build_path)?;
         file::create_dir_all(self.python_build_path().parent().unwrap())?;
         let git = Git::new(self.python_build_path());
-        let pr = ctx.map(|ctx| &ctx.pr);
+        let pr = ctx.map(|ctx| ctx.pr.as_ref());
         let mut clone_options = CloneOptions::default();
         if let Some(pr) = pr {
             clone_options = clone_options.pr(pr);
@@ -122,29 +170,28 @@ impl PythonPlugin {
             .get_or_try_init_async(async || {
                 let settings = Settings::get();
                 let url_path = python_precompiled_url_path(&settings);
-                let rsp = match settings.paranoid {
-                    true => {
-                        HTTP_FETCH
-                            .get_bytes(format!("https://mise-versions.jdx.dev/{url_path}"))
-                            .await
-                    }
-                    // using http is not a security concern and enabling tls makes mise significantly slower
-                    false => {
-                        HTTP_FETCH
-                            .get_bytes(format!("http://mise-versions.jdx.dev/{url_path}"))
-                            .await
-                    }
-                }?;
+                let rsp = HTTP_FETCH
+                    .get_bytes(format!("https://mise-versions.jdx.dev/tools/{url_path}"))
+                    .await?;
                 let mut decoder = GzDecoder::new(rsp.as_ref());
                 let mut raw = String::new();
                 decoder.read_to_string(&mut raw)?;
                 let platform = python_precompiled_platform();
+                let flavor = settings.python.precompiled_flavor.clone();
                 // order by version, whether it is a release candidate, date, and in the preferred order of install types
                 let rank = |v: &str, date: &str, name: &str| {
                     let rc = if regex!(r"rc\d+$").is_match(v) { 0 } else { 1 };
                     let v = Versioning::new(v);
                     let date = date.parse::<i64>().unwrap_or_default();
-                    let install_type = if name.contains("install_only_stripped") {
+                    let install_type = if let Some(ref flavor) = flavor {
+                        // When flavor is set, prefer exact match
+                        let name_without_ext = name.trim_end_matches(".tar.gz");
+                        if name_without_ext.ends_with(flavor.as_str()) {
+                            0
+                        } else {
+                            1
+                        }
+                    } else if name.contains("install_only_stripped") {
                         0
                     } else if name.contains("install_only") {
                         1
@@ -236,7 +283,7 @@ impl PythonPlugin {
         let tarball_path = download.join(filename);
 
         ctx.pr.set_message(format!("download {filename}"));
-        HTTP.download_file(&url, &tarball_path, Some(&ctx.pr))
+        HTTP.download_file(&url, &tarball_path, Some(ctx.pr.as_ref()))
             .await?;
 
         file::remove_all(&install)?;
@@ -245,8 +292,8 @@ impl PythonPlugin {
             &install,
             &TarOptions {
                 strip_components: 1,
-                pr: Some(&ctx.pr),
-                ..Default::default()
+                pr: Some(ctx.pr.as_ref()),
+                ..TarOptions::new(TarFormat::from_file_name(filename))
             },
         )?;
         if !install.join("bin").exists() {
@@ -271,7 +318,7 @@ impl PythonPlugin {
             .map(|s| re_digits.replace(s, "").to_string());
         if cfg!(unix) {
             if let (Some(major), Some(minor), Some(suffix)) = (major, minor, suffix) {
-                if tv.request.options().get("patch_sysconfig") != Some(&"false".to_string()) {
+                if tv.request.options().get("patch_sysconfig") != Some("false") {
                     sysconfig::update_sysconfig(&install, major, minor, &suffix)?;
                 }
             } else {
@@ -294,7 +341,7 @@ impl PythonPlugin {
         }
         ctx.pr.set_message("python-build".into());
         let mut cmd = CmdLineRunner::new(self.python_build_bin())
-            .with_pr(&ctx.pr)
+            .with_pr(ctx.pr.as_ref())
             .arg(tv.version.as_str())
             .arg(tv.install_path())
             .env("PIP_REQUIRE_VIRTUALENV", "false")
@@ -328,7 +375,7 @@ impl PythonPlugin {
         config: &Arc<Config>,
         packages_file: &Path,
         tv: &ToolVersion,
-        pr: &Box<dyn SingleReport>,
+        pr: &dyn SingleReport,
     ) -> eyre::Result<()> {
         if !packages_file.exists() {
             return Ok(());
@@ -351,7 +398,6 @@ impl PythonPlugin {
         &self,
         config: &Arc<Config>,
         tv: &ToolVersion,
-        pr: Option<&Box<dyn SingleReport>>,
     ) -> eyre::Result<Option<PathBuf>> {
         if let Some(virtualenv) = tv.request.options().get("virtualenv") {
             if !Settings::get().experimental {
@@ -368,26 +414,13 @@ impl PythonPlugin {
                 }
             }
             if !virtualenv.exists() {
-                if Settings::get().python.venv_auto_create {
-                    info!("setting up virtualenv at: {}", virtualenv.display());
-                    let mut cmd = CmdLineRunner::new(python_path(tv))
-                        .arg("-m")
-                        .arg("venv")
-                        .arg(&virtualenv)
-                        .envs(config.env().await?);
-                    if let Some(pr) = pr {
-                        cmd = cmd.with_pr(pr);
-                    }
-                    cmd.execute()?;
-                } else {
-                    warn!(
-                        "no venv found at: {p}\n\n\
-                        To create a virtualenv manually, run:\n\
-                        python -m venv {p}",
-                        p = display_path(&virtualenv)
-                    );
-                    return Ok(None);
-                }
+                warn!(
+                    "no venv found at: {p}\n\n\
+                    To create a virtualenv manually, run:\n\
+                    python -m venv {p}",
+                    p = display_path(&virtualenv)
+                );
+                return Ok(None);
             }
             // TODO: enable when it is more reliable
             // self.check_venv_python(&virtualenv, tv)?;
@@ -415,7 +448,7 @@ impl PythonPlugin {
         &self,
         config: &Arc<Config>,
         tv: &ToolVersion,
-        pr: &Box<dyn SingleReport>,
+        pr: &dyn SingleReport,
     ) -> eyre::Result<()> {
         pr.set_message("python --version".into());
         CmdLineRunner::new(python_path(tv))
@@ -423,6 +456,82 @@ impl PythonPlugin {
             .arg("--version")
             .envs(config.env().await?)
             .execute()
+    }
+
+    /// Fetch the best precompiled release for a specific version and platform target.
+    /// Unlike `fetch_precompiled_remote_versions` which uses compile-time cfg!() macros,
+    /// this takes a PlatformTarget to support cross-platform lockfile generation.
+    /// Respects precompiled_arch, precompiled_os, and precompiled_flavor settings
+    /// when the target matches the current platform.
+    async fn fetch_precompiled_for_target(
+        &self,
+        version: &str,
+        target: &PlatformTarget,
+    ) -> eyre::Result<Option<(String, String)>> {
+        let settings = Settings::get();
+
+        // Use settings-aware arch/os for the current platform,
+        // target-based defaults for other platforms
+        let (arch, os) = if target.is_current() {
+            (python_arch(&settings).to_string(), python_os(&settings))
+        } else {
+            (
+                python_arch_for_target(target).to_string(),
+                python_os_for_target(target).to_string(),
+            )
+        };
+
+        let platform = format!("{arch}-{os}");
+        let url_path = format!("python-precompiled-{arch}-{os}.gz");
+        let rsp = HTTP_FETCH
+            .get_bytes(format!("https://mise-versions.jdx.dev/tools/{url_path}"))
+            .await?;
+        let mut decoder = GzDecoder::new(rsp.as_ref());
+        let mut raw = String::new();
+        decoder.read_to_string(&mut raw)?;
+
+        let flavor = settings.python.precompiled_flavor.clone();
+
+        // Find all entries matching this version, then pick the best one
+        let result = raw
+            .lines()
+            .filter(|v| v.contains(&platform))
+            .flat_map(|v| {
+                regex!(r"^cpython-(\d+\.\d+\.[\da-z]+)\+(\d+).*")
+                    .captures(v)
+                    .map(|caps| {
+                        (
+                            caps[1].to_string(),
+                            caps[2].to_string(),
+                            caps[0].to_string(),
+                        )
+                    })
+            })
+            .filter(|(v, _, _)| v == version)
+            .min_by_key(|(_, date, name)| {
+                let install_type = if let Some(ref flavor) = flavor {
+                    // When flavor is set, prefer exact match
+                    let name_without_ext = name.trim_end_matches(".tar.gz");
+                    if name_without_ext.ends_with(flavor.as_str()) {
+                        0
+                    } else {
+                        1
+                    }
+                } else {
+                    // Default: prefer install_only_stripped > install_only > other
+                    if name.contains("install_only_stripped") {
+                        0
+                    } else if name.contains("install_only") {
+                        1
+                    } else {
+                        2
+                    }
+                };
+                let date = date.parse::<i64>().unwrap_or_default();
+                (install_type, -date)
+            })
+            .map(|(_, tag, filename)| (tag, filename));
+        Ok(result)
     }
 }
 
@@ -432,32 +541,45 @@ impl Backend for PythonPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<String>> {
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         if cfg!(windows) || Settings::get().python.compile == Some(false) {
             Ok(self
                 .fetch_precompiled_remote_versions()
                 .await?
                 .iter()
-                .map(|(v, _, _)| v.clone())
+                .map(|(v, _, _)| VersionInfo {
+                    version: v.clone(),
+                    ..Default::default()
+                })
                 .collect())
         } else {
             self.install_or_update_python_build(None)?;
             let python_build_bin = self.python_build_bin();
-            plugins::core::run_fetch_task_with_timeout(move || {
-                let output = cmd!(python_build_bin, "--definitions").read()?;
+            let python_build_str = python_build_bin.to_string_lossy().to_string();
+            plugins::core::run_fetch_task_with_timeout_async(async move || {
+                let output = crate::cmd::cmd_read_async_inherited_env(
+                    &python_build_str,
+                    &["--definitions"],
+                    std::iter::empty::<(&str, &std::ffi::OsStr)>(),
+                )
+                .await?;
                 let versions = output
                     .split('\n')
                     // remove free-threaded pythons like 3.13t and 3.14t-dev
                     .filter(|s| !regex!(r"\dt(-dev)?$").is_match(s))
-                    .map(|s| s.to_string())
-                    .sorted_by_cached_key(|v| regex!(r"^\d+").is_match(v))
+                    .map(|s| VersionInfo {
+                        version: s.to_string(),
+                        ..Default::default()
+                    })
+                    .sorted_by_cached_key(|v| python_version_sort_key(&v.version))
                     .collect();
                 Ok(versions)
             })
+            .await
         }
     }
 
-    fn idiomatic_filenames(&self) -> eyre::Result<Vec<String>> {
+    async fn _idiomatic_filenames(&self) -> eyre::Result<Vec<String>> {
         Ok(vec![
             ".python-version".to_string(),
             ".python-versions".to_string(),
@@ -470,14 +592,14 @@ impl Backend for PythonPlugin {
         } else {
             self.install_compiled(ctx, &tv).await?;
         }
-        self.test_python(&ctx.config, &tv, &ctx.pr).await?;
-        if let Err(e) = self.get_virtualenv(&ctx.config, &tv, Some(&ctx.pr)).await {
+        self.test_python(&ctx.config, &tv, ctx.pr.as_ref()).await?;
+        if let Err(e) = self.get_virtualenv(&ctx.config, &tv).await {
             warn!("failed to get virtualenv: {e:#}");
         }
         if let Some(default_file) = &Settings::get().python.default_packages_file {
             let default_file = file::replace_path(default_file);
             if let Err(err) = self
-                .install_default_packages(&ctx.config, &default_file, &tv, &ctx.pr)
+                .install_default_packages(&ctx.config, &default_file, &tv, ctx.pr.as_ref())
                 .await
             {
                 warn!("failed to install default python packages: {err:#}");
@@ -502,7 +624,7 @@ impl Backend for PythonPlugin {
         tv: &ToolVersion,
     ) -> eyre::Result<BTreeMap<String, String>> {
         let mut hm = BTreeMap::new();
-        match self.get_virtualenv(config, tv, None).await {
+        match self.get_virtualenv(config, tv).await {
             Err(e) => warn!("failed to get virtualenv: {e}"),
             Ok(Some(virtualenv)) => {
                 let bin = virtualenv.join("bin");
@@ -528,6 +650,75 @@ impl Backend for PythonPlugin {
                 ))
             })
             .clone()
+    }
+
+    fn resolve_lockfile_options(
+        &self,
+        _request: &ToolRequest,
+        target: &PlatformTarget,
+    ) -> BTreeMap<String, String> {
+        let mut opts = BTreeMap::new();
+        let settings = Settings::get();
+        let is_current_platform = target.is_current();
+
+        // Only include compile option if true (non-default)
+        let compile = if is_current_platform {
+            settings.python.compile.unwrap_or(false)
+        } else {
+            false
+        };
+        if compile {
+            opts.insert("compile".to_string(), "true".to_string());
+        }
+
+        // Include precompiled options for all platforms to avoid splitting
+        // lockfile entries between host and non-host platforms (#8390)
+        if !compile {
+            if let Some(arch) = settings.python.precompiled_arch.clone() {
+                opts.insert("precompiled_arch".to_string(), arch);
+            }
+            if let Some(os) = settings.python.precompiled_os.clone() {
+                opts.insert("precompiled_os".to_string(), os);
+            }
+            if let Some(flavor) = settings.python.precompiled_flavor.clone() {
+                opts.insert("precompiled_flavor".to_string(), flavor);
+            }
+        }
+
+        opts
+    }
+
+    async fn resolve_lock_info(
+        &self,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> Result<PlatformInfo> {
+        let version = &tv.version;
+
+        // Look up the precompiled release for this version and target platform
+        let Some((tag, filename)) = self.fetch_precompiled_for_target(version, target).await?
+        else {
+            return Ok(PlatformInfo::default());
+        };
+
+        let url = format!(
+            "https://github.com/astral-sh/python-build-standalone/releases/download/{tag}/{filename}"
+        );
+
+        // Fetch SHA256SUMS from the release to get the checksum
+        let shasums_url = format!(
+            "https://github.com/astral-sh/python-build-standalone/releases/download/{tag}/SHA256SUMS"
+        );
+        let checksum = fetch_checksum_from_shasums(&shasums_url, &filename).await;
+
+        Ok(PlatformInfo {
+            url: Some(url),
+            checksum,
+            size: None,
+            url_api: None,
+            conda_deps: None,
+            ..Default::default()
+        })
     }
 }
 
@@ -593,6 +784,23 @@ fn python_precompiled_platform() -> String {
         format!("{arch}-{os}-{flavor}")
     } else {
         format!("{arch}-{os}")
+    }
+}
+
+/// Map a PlatformTarget OS to the python-build-standalone OS string.
+fn python_os_for_target(target: &PlatformTarget) -> &'static str {
+    match target.os_name() {
+        "macos" => "apple-darwin",
+        "windows" => "pc-windows-msvc",
+        _ => "unknown-linux-gnu",
+    }
+}
+
+/// Map a PlatformTarget arch to the python-build-standalone arch string.
+fn python_arch_for_target(target: &PlatformTarget) -> &'static str {
+    match target.arch_name() {
+        "arm64" => "aarch64",
+        _ => "x86_64",
     }
 }
 

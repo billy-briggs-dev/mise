@@ -1,21 +1,23 @@
 use eyre::{Result, bail, eyre};
 use toml_edit::DocumentMut;
 
-use crate::config::settings::{SETTINGS_META, SettingsFile, SettingsType};
+use crate::config::settings::{SETTINGS_META, SettingsFile, SettingsType, parse_url_replacements};
 use crate::toml::dedup_toml_array;
 use crate::{config, duration, file};
 
 /// Add/update a setting
 ///
-/// This modifies the contents of ~/.config/mise/config.toml
+/// This modifies the contents of ~/.config/mise/config.toml by default.
+/// With `--local`, modifies the local config file instead.
+/// See https://mise.jdx.dev/configuration.html#target-file-for-write-operations
 #[derive(Debug, clap::Args)]
 #[clap(visible_aliases = ["create"], after_long_help = AFTER_LONG_HELP, verbatim_doc_comment)]
 pub struct SettingsSet {
     /// The setting to set
     #[clap()]
     pub setting: String,
-    /// The value to set
-    pub value: String,
+    /// The value to set (optional if provided as KEY=VALUE)
+    pub value: Option<String>,
     /// Use the local config file instead of the global one
     #[clap(long, short)]
     pub local: bool,
@@ -23,7 +25,17 @@ pub struct SettingsSet {
 
 impl SettingsSet {
     pub fn run(self) -> Result<()> {
-        set(&self.setting, &self.value, false, self.local)
+        match self.value {
+            Some(value) => set(&self.setting, &value, false, self.local),
+            None => {
+                let (key, value) = self.setting.split_once('=').ok_or_else(|| {
+                    eyre!(
+                        "Usage: mise settings set <KEY>=<VALUE> or mise settings set <KEY> <VALUE>"
+                    )
+                })?;
+                set(key, value, false, self.local)
+            }
+        }
     }
 }
 
@@ -43,6 +55,8 @@ pub fn set(mut key: &str, value: &str, add: bool, local: bool) -> Result<()> {
         SettingsType::ListString => parse_list_by_comma(value)?,
         SettingsType::ListPath => parse_list_by_colon(value)?,
         SettingsType::SetString => parse_set_by_comma(value)?,
+        SettingsType::IndexMap => parse_indexmap_by_json(value)?,
+        SettingsType::BoolOrString => parse_bool(value).unwrap_or_else(|_| value.into()),
     };
 
     let path = if local {
@@ -131,6 +145,18 @@ fn parse_i64(value: &str) -> Result<toml_edit::Value> {
 fn parse_duration(value: &str) -> Result<toml_edit::Value> {
     duration::parse_duration(value)?;
     Ok(value.into())
+}
+
+fn parse_indexmap_by_json(value: &str) -> Result<toml_edit::Value> {
+    let index_map = parse_url_replacements(value)
+        .map_err(|e| eyre!("Failed to parse JSON for IndexMap: {}", e))?;
+    Ok(toml_edit::Value::InlineTable({
+        let mut table = toml_edit::InlineTable::new();
+        for (k, v) in index_map {
+            table.insert(&k, toml_edit::Value::String(toml_edit::Formatted::new(v)));
+        }
+        table
+    }))
 }
 
 static AFTER_LONG_HELP: &str = color_print::cstr!(

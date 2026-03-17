@@ -28,6 +28,13 @@ $ python3.11 -V
 3.11.0
 ```
 
+You can also install a specific python flavour. To get the latest version from a flavour just use the
+flavour prefix.
+
+```sh
+mise use -g python@anaconda         # latest version of anaconda
+```
+
 See the [Python Cookbook](/mise-cookbook/python.html) for common tasks and examples.
 
 ## `.python-version` support
@@ -49,19 +56,49 @@ _.python.venv = "/root/.venv" # can be absolute
 _.python.venv = "{{env.HOME}}/.cache/venv/myproj" # can use templates
 _.python.venv = { path = ".venv", create = true } # create the venv if it doesn't exist
 _.python.venv = { path = ".venv", create = true, python = "3.10" } # use a specific python version
-_.python.venv = { path = ".venv", create = true, python_create_args = ["--without-pip"] } # pass args to python -m venv
-_.python.venv = { path = ".venv", create = true, uv_create_args = ["--system-site-packages"] } # pass args to uv venv
+_.python.venv = {
+  path = ".venv", create = true,
+  python_create_args = ["--without-pip"], # pass args to python -m venv
+}
+_.python.venv = {
+  path = ".venv", create = true,
+  uv_create_args = ["--system-site-packages"], # pass args to uv venv
+}
 # Install seed packages (pip, setuptools, and wheel) into the virtual environment.
 _.python.venv = { path = ".venv", create = true, uv_create_args = ['--seed'] }
 ```
 
 The venv will need to be created manually with `python -m venv /path/to/venv` unless `create=true`.
+See [env-directives](https://mise.jdx.dev/environments/#env-directives) for `_.python.venv`.
 
 ## mise & uv
 
 If you have installed `uv` (for example, with `mise use -g uv@latest`), `mise` will use it to create virtual environments. Otherwise, it will use the built-in `python -m venv` command.
 
 Note that `uv` does not include `pip` by default (as `uv` provides `uv pip` instead). If you need the `pip` package, add the `uv_create_args = ['--seed']` option.
+
+:::warning
+The `true` value for `python.uv_venv_auto` is considered legacy and will be deprecated in a
+future release (planned for mise 2026.7). Prefer `"source"` or `"create|source"` instead.
+Note: the `python.uv_venv_auto` **setting** itself is not going away — only the `true` value is
+being phased out.
+:::
+
+One difference between the legacy `true` value and the newer string values is that `true` also
+exports `UV_PYTHON` (set to just the Python version number). This tells `uv` which Python version
+to use, but does not guarantee that `uv` uses the specific interpreter managed by `mise` — `uv`
+may fall back to a system or self-managed Python of the same version.
+
+To strictly ensure `uv` uses `mise`'s managed Python interpreter, set `UV_PYTHON` to the actual
+install path instead:
+
+```toml
+[tools]
+python = "3.12"
+
+[env]
+UV_PYTHON = { value = "{{ tools.python.path }}", tools = true }
+```
 
 See the [mise + uv Cookbook](/mise-cookbook/python.html#mise-uv) for more examples.
 

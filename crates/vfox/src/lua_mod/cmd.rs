@@ -1,5 +1,5 @@
-use mlua::prelude::*;
 use mlua::Table;
+use mlua::prelude::*;
 use std::path::Path;
 
 pub fn mod_cmd(lua: &Lua) -> LuaResult<()> {
@@ -11,7 +11,7 @@ pub fn mod_cmd(lua: &Lua) -> LuaResult<()> {
     Ok(())
 }
 
-fn exec(_lua: &Lua, args: mlua::MultiValue) -> LuaResult<String> {
+fn exec(lua: &Lua, args: mlua::MultiValue) -> LuaResult<String> {
     use std::process::Command;
 
     let (command, options) = match args.len() {
@@ -44,7 +44,17 @@ fn exec(_lua: &Lua, args: mlua::MultiValue) -> LuaResult<String> {
         cmd.args(["-c", &command]);
     }
 
-    // Apply options if provided
+    // Apply mise-constructed environment if available in Lua registry.
+    // This ensures mise-managed tools are on PATH when called from env module hooks.
+    if let Ok(mise_env) = lua.named_registry_value::<Table>("mise_env") {
+        cmd.env_clear();
+        for pair in mise_env.pairs::<String, String>() {
+            let (key, value) = pair?;
+            cmd.env(key, value);
+        }
+    }
+
+    // Apply options if provided (explicit env vars override mise env)
     if let Some(options) = options {
         // Set working directory if specified
         if let Ok(cwd) = options.get::<String>("cwd") {
@@ -102,16 +112,26 @@ mod tests {
 
     #[test]
     fn test_cmd_with_cwd() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+        // Canonicalize to resolve symlinks (e.g., /var -> /private/var on macOS)
+        let temp_path_canonical = temp_path
+            .canonicalize()
+            .unwrap_or_else(|_| temp_path.to_path_buf());
+        let temp_dir_str = temp_path_canonical.to_string_lossy().to_string();
+        let expected_path = temp_dir_str.trim_end_matches('/').to_string();
         let lua = Lua::new();
         mod_cmd(&lua).unwrap();
         lua.load(mlua::chunk! {
             local cmd = require("cmd")
             -- Test with working directory
-            local result = cmd.exec("pwd", {cwd = "/tmp"})
-            assert(result:find("/tmp") ~= nil)
+            local result = cmd.exec("pwd", {cwd = $temp_dir_str})
+            -- Check that result contains the expected path (handles trailing slashes/newlines)
+            assert(result:find($expected_path) ~= nil, "Expected result to contain: " .. $expected_path .. " but got: " .. result)
         })
         .exec()
         .unwrap();
+        // TempDir automatically cleans up when dropped
     }
 
     #[test]

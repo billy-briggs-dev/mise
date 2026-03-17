@@ -11,12 +11,15 @@ use serde::Deserialize;
 use versions::Versioning;
 
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
+use crate::backend::platform_target::PlatformTarget;
+use crate::backend::static_helpers::fetch_checksum_from_file;
 use crate::cli::args::BackendArg;
-use crate::cli::version::OS;
 use crate::cmd::CmdLineRunner;
-use crate::config::{Config, Settings};
+use crate::config::Config;
 use crate::http::{HTTP, HTTP_FETCH};
 use crate::install_context::InstallContext;
+use crate::lockfile::PlatformInfo;
 use crate::toolset::{ToolRequest, ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
 use crate::{file, plugins};
@@ -41,7 +44,7 @@ impl DenoPlugin {
         })
     }
 
-    fn test_deno(&self, tv: &ToolVersion, pr: &Box<dyn SingleReport>) -> Result<()> {
+    fn test_deno(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<()> {
         pr.set_message("deno -V".into());
         CmdLineRunner::new(self.deno_bin(tv))
             .with_pr(pr)
@@ -49,31 +52,21 @@ impl DenoPlugin {
             .execute()
     }
 
-    async fn download(&self, tv: &ToolVersion, pr: &Box<dyn SingleReport>) -> Result<PathBuf> {
-        let settings = Settings::get();
-        let url = format!(
-            "https://dl.deno.land/release/v{}/deno-{}-{}.zip",
-            tv.version,
-            arch(&settings),
-            os()
-        );
+    async fn download(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<PathBuf> {
+        let url = self
+            .get_tarball_url(tv, &PlatformTarget::from_current())
+            .await?
+            .ok_or_else(|| eyre::eyre!("Failed to get deno tarball URL"))?;
         let filename = url.split('/').next_back().unwrap();
         let tarball_path = tv.download_path().join(filename);
 
         pr.set_message(format!("download {filename}"));
         HTTP.download_file(&url, &tarball_path, Some(pr)).await?;
 
-        // TODO: hash::ensure_checksum_sha256(&tarball_path, &m.sha256)?;
-
         Ok(tarball_path)
     }
 
-    fn install(
-        &self,
-        tv: &ToolVersion,
-        pr: &Box<dyn SingleReport>,
-        tarball_path: &Path,
-    ) -> Result<()> {
+    fn install(&self, tv: &ToolVersion, pr: &dyn SingleReport, tarball_path: &Path) -> Result<()> {
         let filename = tarball_path.file_name().unwrap().to_string_lossy();
         pr.set_message(format!("extract {filename}"));
         file::remove_all(tv.install_path())?;
@@ -91,7 +84,7 @@ impl DenoPlugin {
         Ok(())
     }
 
-    fn verify(&self, tv: &ToolVersion, pr: &Box<dyn SingleReport>) -> Result<()> {
+    fn verify(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<()> {
         self.test_deno(tv, pr)
     }
 }
@@ -102,21 +95,32 @@ impl Backend for DenoPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
+    async fn security_info(&self) -> Vec<crate::backend::SecurityFeature> {
+        use crate::backend::SecurityFeature;
+
+        vec![SecurityFeature::Checksum {
+            algorithm: Some("sha256".to_string()),
+        }]
+    }
+
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
         let versions: DenoVersions = HTTP_FETCH.json("https://deno.com/versions.json").await?;
         let versions = versions
             .cli
             .into_iter()
             .filter(|v| v.starts_with('v'))
-            .map(|v| v.trim_start_matches('v').to_string())
-            .unique()
-            .sorted_by_cached_key(|s| (Versioning::new(s), s.to_string()))
+            .map(|v| VersionInfo {
+                version: v.trim_start_matches('v').to_string(),
+                ..Default::default()
+            })
+            .unique_by(|v| v.version.clone())
+            .sorted_by_cached_key(|v| (Versioning::new(&v.version), v.version.clone()))
             .collect();
         Ok(versions)
     }
 
-    fn idiomatic_filenames(&self) -> Result<Vec<String>> {
-        Ok(vec![".deno-version".into()])
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
+        Ok(vec![".deno-version".into(), "package.json".into()])
     }
 
     async fn install_version_(
@@ -124,10 +128,12 @@ impl Backend for DenoPlugin {
         ctx: &InstallContext,
         mut tv: ToolVersion,
     ) -> Result<ToolVersion> {
-        let tarball_path = self.download(&tv, &ctx.pr).await?;
+        let tarball_path = self.download(&tv, ctx.pr.as_ref()).await?;
+        ctx.pr.next_operation();
         self.verify_checksum(ctx, &mut tv, &tarball_path)?;
-        self.install(&tv, &ctx.pr, &tarball_path)?;
-        self.verify(&tv, &ctx.pr)?;
+        ctx.pr.next_operation();
+        self.install(&tv, ctx.pr.as_ref(), &tarball_path)?;
+        self.verify(&tv, ctx.pr.as_ref())?;
 
         Ok(tv)
     }
@@ -159,25 +165,51 @@ impl Backend for DenoPlugin {
         )]);
         Ok(map)
     }
-}
 
-fn os() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "apple-darwin"
-    } else if cfg!(target_os = "linux") {
-        "unknown-linux-gnu"
-    } else if cfg!(target_os = "windows") {
-        "pc-windows-msvc"
-    } else {
-        &OS
+    async fn get_tarball_url(
+        &self,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> Result<Option<String>> {
+        let arch = match target.arch_name() {
+            "x64" => "x86_64",
+            "arm64" => "aarch64",
+            other => other,
+        };
+        let os = match target.os_name() {
+            "macos" => "apple-darwin",
+            "linux" => "unknown-linux-gnu",
+            "windows" => "pc-windows-msvc",
+            _ => "unknown-linux-gnu",
+        };
+        Ok(Some(format!(
+            "https://dl.deno.land/release/v{}/deno-{}-{}.zip",
+            tv.version, arch, os
+        )))
     }
-}
 
-fn arch(settings: &Settings) -> &str {
-    match settings.arch() {
-        "x64" => "x86_64",
-        "arm64" => "aarch64",
-        other => other,
+    async fn resolve_lock_info(
+        &self,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> Result<PlatformInfo> {
+        let url = self
+            .get_tarball_url(tv, target)
+            .await?
+            .ok_or_else(|| eyre::eyre!("Failed to get deno tarball URL"))?;
+
+        // Deno provides .sha256sum files alongside each zip
+        let checksum_url = format!("{}.sha256sum", &url);
+        let checksum = fetch_checksum_from_file(&checksum_url, "sha256").await;
+
+        Ok(PlatformInfo {
+            url: Some(url),
+            checksum,
+            size: None,
+            url_api: None,
+            conda_deps: None,
+            ..Default::default()
+        })
     }
 }
 

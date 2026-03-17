@@ -19,22 +19,27 @@ You use it like so (note that `mise` must be [activated](/getting-started.html#a
 
 ```bash
 mkdir example-project && cd example-project
-mise use node@22
+mise use node@24
 node -v
-# v22.0.0
+# v24.x.x
 ```
 
 And you'll also note that you now have a `mise.toml` file with the following content:
 
-```toml [mise.toml]
+```mise-toml [mise.toml]
 [tools]
-node = "22"
+node = "24"
 ```
 
 - If this file is in the root of a project, `node` will be installed whenever someone runs [`mise install|i`](/cli/install).
 - This is the command you want to run when you first clone a project or when you want to update installed tools.
 
 ## `mise.toml` Configuration
+
+You can create a `mise.toml` file manually or with the CLI.
+
+> [!TIP]
+> Use `mise edit` to open an interactive editor for your configuration. It provides a TUI where you can navigate sections, add tools from the registry with fuzzy search, and configure settings with schema-aware autocompletion.
 
 Use [`mise.toml`](/configuration#mise-toml) to share your tool configurations with others. This file should be committed to version control and contains the common toolset needed for your project.
 
@@ -61,7 +66,7 @@ If you leave out the version, then mise will default to `node@latest`.
 
 ## Dev Tool Backends
 
-Tools are installed with a variety of backends like `asdf`, `ubi`, or `vfox`. See [registry](/registry.html) for
+Tools are installed with a variety of backends like `asdf`, `github`, or `vfox`. See [registry](/registry.html) for
 the full list of shorthands like `node` you can use.
 
 You can also use other backends like `npm` or `cargo`
@@ -78,11 +83,11 @@ Upgrading tool versions can be done with [`mise up|upgrade`](/cli/upgrade). By d
 the version prefix in `mise.toml`. If a [lockfile](/configuration/settings#lockfile) exists,
 mise will update `mise.lock` to the latest version of the tool with the prefix from `mise.toml`.
 
-So if you have `node = "22"` in `mise.toml`, then `mise upgrade node` will upgrade to the latest version of `node 22`.
+So if you have `node = "24"` in `mise.toml`, then `mise upgrade node` will upgrade to the latest version of `node 24`.
 
 If you'd like to upgrade to the latest version of node, you can use `mise upgrade --bump node`. It will set the version
-at the same specificity as the current version, so if you have `node = "22"`, but use `mise upgrade --bump node` to update to
-`node@24`, then it will set `node = "24"` in `mise.toml`.
+at the same specificity as the current version, so if you have `node = "24"`, but use `mise upgrade --bump node` to update to
+`node@26`, then it will set `node = "26"` in `mise.toml`.
 
 _See [Dev Tools](/dev-tools/) for more information on working with tools._
 
@@ -130,7 +135,7 @@ Tasks are defined in a project to execute commands.
 
 You can define tasks in a `mise.toml`:
 
-```toml [mise.toml]
+```mise-toml [mise.toml]
 [tasks]
 build = "npm run build"
 test = "npm test"
@@ -176,7 +181,7 @@ set -e
 echo "all available options are in the env with the prefix 'usage_'"
 env | grep usage_
 
-echo "$usage_greeting, $usage_user! Your message is: $usage_message"
+echo "${usage_greeting?}, ${usage_user?}! Your message is: ${usage_message?}"
 ```
 
 This task can be run like so:
@@ -191,7 +196,7 @@ mise run greet --user jdx -g "hey" "How are you?"
   as options.
 - [Custom completion](https://usage.jdx.dev/spec/reference/complete) can be provided by a CLI. `mise run greet --dir <tab>` will execute `find . -maxdepth 1 -type d` to provide completions.
 
-To get the autocopletion working, set up [mise autocompletions](/installing-mise.html#autocompletion).
+To get the autocompletion working, set up [mise autocompletions](/installing-mise.html#autocompletion).
 
 _See [Tasks](/tasks/) for more information on working with tasks._
 
@@ -231,5 +236,5 @@ For further reading:
 - [Configuration](/configuration) – More information on `mise.toml` files
 - [Settings](/configuration/settings) – All the configuration settings available in mise
 - [Backends](/dev-tools/backends/) – An index of all the backends available in mise
-- [Registry](/registry) – Every "shorthand" available for tools in mise like `node`, `terraform`, or `watchexec` which point to `core:node`, `asdf:asdf-community/asdf-hashicorp`, and `ubi:watchexec/watchexec` respectively
+- [Registry](/registry) – Every "shorthand" available for tools in mise like `node`, `terraform`, or `watchexec` which point to `core:node`, `asdf:asdf-community/asdf-hashicorp`, and `aqua:watchexec/watchexec` respectively
 - [CLI](/cli/) – The full list of commands available in mise

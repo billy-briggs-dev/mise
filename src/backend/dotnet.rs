@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
@@ -8,6 +9,9 @@ use crate::http::HTTP_FETCH;
 use crate::{backend::Backend, config::Config};
 use async_trait::async_trait;
 use eyre::eyre;
+
+/// Dotnet backend requires experimental mode to be enabled
+pub const EXPERIMENTAL: bool = true;
 
 #[derive(Debug)]
 pub struct DotnetBackend {
@@ -28,7 +32,7 @@ impl Backend for DotnetBackend {
         Ok(vec!["dotnet"])
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<String>> {
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
         let feed_url = self.get_search_url().await?;
 
         let feed: NugetFeedSearch = HTTP_FETCH
@@ -54,7 +58,14 @@ impl Backend for DotnetBackend {
             return Err(eyre!("Tool {} not found", &self.tool_name()));
         }
 
-        Ok(data.versions.iter().map(|x| x.version.clone()).collect())
+        Ok(data
+            .versions
+            .iter()
+            .map(|x| VersionInfo {
+                version: x.version.clone(),
+                ..Default::default()
+            })
+            .collect())
     }
 
     async fn install_version_(
@@ -63,6 +74,16 @@ impl Backend for DotnetBackend {
         tv: crate::toolset::ToolVersion,
     ) -> eyre::Result<crate::toolset::ToolVersion> {
         Settings::get().ensure_experimental("dotnet backend")?;
+
+        // Check if dotnet is available
+        self.warn_if_dependency_missing(
+            &ctx.config,
+            "dotnet",
+            "To use dotnet tools with mise, you need to install .NET SDK first:\n\
+              mise use dotnet@latest\n\n\
+            Or install .NET SDK via https://dotnet.microsoft.com/download",
+        )
+        .await;
 
         let mut cli = CmdLineRunner::new("dotnet")
             .arg("tool")
@@ -75,7 +96,7 @@ impl Backend for DotnetBackend {
             cli = cli.arg("--version").arg(&tv.version);
         }
 
-        cli.with_pr(&ctx.pr)
+        cli.with_pr(ctx.pr.as_ref())
             .envs(self.dependency_env(&ctx.config).await?)
             .execute()?;
 

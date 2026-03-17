@@ -19,7 +19,7 @@ pub struct GithubRelease {
     // pub body: Option<String>,
     pub draft: bool,
     pub prerelease: bool,
-    // pub created_at: String,
+    pub created_at: String,
     // pub published_at: Option<String>,
     pub assets: Vec<GithubAsset>,
 }
@@ -27,6 +27,35 @@ pub struct GithubRelease {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubTag {
     pub name: String,
+    pub commit: Option<GithubTagCommit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubTagCommit {
+    pub sha: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubCommit {
+    pub commit: GithubCommitInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubCommitInfo {
+    pub committer: GithubCommitPerson,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubCommitPerson {
+    pub date: String,
+}
+
+/// Tag with date information
+#[derive(Debug, Clone)]
+pub struct GithubTagWithDate {
+    pub name: String,
+    pub date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +63,11 @@ pub struct GithubAsset {
     pub name: String,
     // pub size: u64,
     pub browser_download_url: String,
+    pub url: String,
+    /// SHA256 digest provided by GitHub API (format: "sha256:hash")
+    /// Will be null for releases created before this feature was added
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 type CacheGroup<T> = HashMap<String, CacheManager<T>>;
@@ -114,6 +148,7 @@ async fn list_releases_(api_url: &str, repo: &str) -> Result<Vec<GithubRelease>>
 
     if *env::MISE_LIST_ALL_VERSIONS {
         while let Some(next) = next_page(&headers) {
+            headers = get_headers(&next);
             let (more, h) = crate::http::HTTP_FETCH
                 .json_headers_with_headers::<Vec<GithubRelease>, _>(next, &headers)
                 .await?;
@@ -155,6 +190,7 @@ async fn list_tags_(api_url: &str, repo: &str) -> Result<Vec<String>> {
 
     if *env::MISE_LIST_ALL_VERSIONS {
         while let Some(next) = next_page(&headers) {
+            headers = get_headers(&next);
             let (more, h) = crate::http::HTTP_FETCH
                 .json_headers_with_headers::<Vec<GithubTag>, _>(next, &headers)
                 .await?;
@@ -164,6 +200,56 @@ async fn list_tags_(api_url: &str, repo: &str) -> Result<Vec<String>> {
     }
 
     Ok(tags.into_iter().map(|t| t.name).collect())
+}
+
+/// List tags with their commit dates. This is slower than `list_tags` as it requires
+/// fetching commit info for each tag. Use only when MISE_LIST_ALL_VERSIONS is set.
+pub async fn list_tags_with_dates(repo: &str) -> Result<Vec<GithubTagWithDate>> {
+    list_tags_with_dates_(API_URL, repo).await
+}
+
+async fn list_tags_with_dates_(api_url: &str, repo: &str) -> Result<Vec<GithubTagWithDate>> {
+    let url = format!("{api_url}/repos/{repo}/tags");
+    let headers = get_headers(&url);
+    let (mut tags, mut response_headers) = crate::http::HTTP_FETCH
+        .json_headers_with_headers::<Vec<GithubTag>, _>(url, &headers)
+        .await?;
+
+    // Fetch all pages when MISE_LIST_ALL_VERSIONS is set
+    while let Some(next) = next_page(&response_headers) {
+        response_headers = get_headers(&next);
+        let (more, h) = crate::http::HTTP_FETCH
+            .json_headers_with_headers::<Vec<GithubTag>, _>(next, &response_headers)
+            .await?;
+        tags.extend(more);
+        response_headers = h;
+    }
+
+    // Fetch commit dates in parallel using the parallel utility
+    let results = crate::parallel::parallel(tags, |tag| async move {
+        let date = if let Some(commit) = tag.commit {
+            let headers = get_headers(&commit.url);
+            match crate::http::HTTP_FETCH
+                .json_with_headers::<GithubCommit, _>(&commit.url, &headers)
+                .await
+            {
+                Ok(commit_info) => Some(commit_info.commit.committer.date),
+                Err(e) => {
+                    warn!("Failed to fetch commit date for tag {}: {}", tag.name, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok((tag.name, date))
+    })
+    .await?;
+
+    Ok(results
+        .into_iter()
+        .map(|(name, date)| GithubTagWithDate { name, date })
+        .collect())
 }
 
 pub async fn get_release(repo: &str, tag: &str) -> Result<GithubRelease> {
@@ -187,7 +273,11 @@ pub async fn get_release_for_url(api_url: &str, repo: &str, tag: &str) -> Result
 }
 
 async fn get_release_(api_url: &str, repo: &str, tag: &str) -> Result<GithubRelease> {
-    let url = format!("{api_url}/repos/{repo}/releases/tags/{tag}");
+    let url = if tag == "latest" {
+        format!("{api_url}/repos/{repo}/releases/latest")
+    } else {
+        format!("{api_url}/repos/{repo}/releases/tags/{tag}")
+    };
     let headers = get_headers(&url);
     crate::http::HTTP_FETCH
         .json_with_headers(url, &headers)
@@ -213,8 +303,8 @@ pub fn get_headers<U: IntoUrl>(url: U) -> HeaderMap {
     let url = url.into_url().unwrap();
     let mut set_headers = |token: &str| {
         headers.insert(
-            "authorization",
-            HeaderValue::from_str(format!("token {token}").as_str()).unwrap(),
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_str(format!("Bearer {token}").as_str()).unwrap(),
         );
         headers.insert(
             "x-github-api-version",
@@ -226,8 +316,18 @@ pub fn get_headers<U: IntoUrl>(url: U) -> HeaderMap {
         if let Some(token) = env::GITHUB_TOKEN.as_ref() {
             set_headers(token);
         }
-    } else if let Some(token) = env::MISE_GITHUB_ENTERPRISE_TOKEN.as_ref() {
+    } else if let Some(token) = env::MISE_GITHUB_ENTERPRISE_TOKEN
+        .as_ref()
+        .or(env::GITHUB_TOKEN.as_ref())
+    {
         set_headers(token);
+    }
+
+    if url.path().contains("/releases/assets/") {
+        headers.insert(
+            "accept",
+            HeaderValue::from_static("application/octet-stream"),
+        );
     }
 
     headers

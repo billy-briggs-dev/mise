@@ -8,11 +8,14 @@ extern crate mlua;
 
 pub use error::Result as VfoxResult;
 pub use error::VfoxError;
+pub use hooks::pre_install::VerifiedAttestation;
 pub use plugin::Plugin;
+pub use vfox::InstallResult;
 pub use vfox::Vfox;
 
 mod config;
 mod context;
+pub mod embedded_plugins;
 mod error;
 mod hooks;
 mod http;

@@ -1,5 +1,7 @@
 # Configuration
 
+Learn how to configure mise for your project with `mise.toml` files, environment variables, and various configuration options to manage your development environment.
+
 ## `mise.toml`
 
 `mise.toml` is the config file for mise. They can be at any of the following file paths (in order of precedence, top overrides configuration of lower paths):
@@ -7,6 +9,7 @@
 - `mise.local.toml` - used for local config, this should not be committed to source control
 - `mise.toml`
 - `mise/config.toml`
+- `.mise/config.toml`
 - `.config/mise.toml` - use this in order to group config files into a common directory
 - `.config/mise/config.toml`
 - `.config/mise/conf.d/*.toml` - all files in this directory will be loaded in alphabetical order
@@ -36,7 +39,7 @@ there will override anything set in
 
 When mise needs configuration, it follows this process:
 
-1. **Walks up the directory tree** from your current location to the root
+1. **Walks up the directory tree** from your current location to the root (or `MISE_CEILING_PATHS`)
 2. **Collects all config files** it finds along the way
 3. **Merges them in order** with more specific (closer to your current directory) settings overriding broader ones
 4. **Applies environment-specific configs** like `mise.dev.toml` if `MISE_ENV` is set
@@ -45,14 +48,24 @@ When mise needs configuration, it follows this process:
 
 ```
 /
-├── etc/mise/config.toml              # System-wide config (highest precedence)
+├── etc/mise/                         # System-wide config (highest precedence)
+│   ├── conf.d/*.toml                 # System fragments, loaded alphabetically
+│   ├── config.toml                   # System defaults
+│   └── config.<env>.toml             # Env-specific system config (MISE_ENV or -E)
 └── home/user/
-    ├── .config/mise/config.toml      # Global user config
+    ├── .config/mise/
+    │   ├── conf.d/*.toml             # User fragments, loaded alphabetically
+    │   ├── config.toml               # Global user config
+    │   ├── config.<env>.toml         # Env-specific user config
+    │   ├── config.local.toml         # User-local overrides
+    │   └── config.<env>.local.toml   # Env-specific user-local overrides
     └── work/
         ├── mise.toml                 # Work-wide settings
         └── myproject/
             ├── mise.local.toml       # Local overrides (git-ignored)
             ├── mise.toml             # Project config
+            ├── mise.<env>.toml       # Env-specific project config
+            ├── mise.<env>.local.toml # Env-specific project local overrides
             └── backend/
                 └── mise.toml         # Service-specific config (lowest precedence)
 ```
@@ -81,7 +94,7 @@ Different configuration sections merge in different ways:
 
 ```toml
 # Global: [tasks.test] = "npm test"
-# Project: [tasks.test] = "yarn test"  
+# Project: [tasks.test] = "yarn test"
 # Result: "yarn test" (completely replaces global)
 ```
 
@@ -95,6 +108,27 @@ Different configuration sections merge in different ways:
 
 ::: tip
 Run `mise config` to see what files mise has loaded in order of precedence.
+:::
+
+### Target File for Write Operations
+
+When commands like [`mise use`](/cli/use), [`mise set`](/cli/set), or [`mise unuse`](/cli/unuse) need to write to a config file, they use the **lowest precedence file in the highest precedence directory**. This means:
+
+- If both `mise.toml` and `mise.local.toml` exist, writes go to `mise.toml`
+- If both `mise.toml` and `mise.production.toml` exist, writes go to `mise.toml`
+- If only `mise.local.toml` exists, writes go to `mise.local.toml`
+
+This behavior ensures that shared configuration (`mise.toml`) is updated by default, while local overrides (`mise.local.toml`) and environment-specific configs remain untouched unless explicitly targeted.
+
+::: info Example
+
+```bash
+# With both mise.toml and mise.local.toml present:
+$ mise use node@22              # writes to mise.toml
+$ mise use --env local node@20  # writes to mise.local.toml
+$ mise set NODE_ENV=production  # writes to mise.toml
+```
+
 :::
 
 Here is what a `mise.toml` looks like:
@@ -171,17 +205,26 @@ _new_ plugin installations. Existing plugins can use any URL.
 [plugins]
 elixir = "https://github.com/my-org/mise-elixir.git"
 node = "https://github.com/my-org/mise-node.git#DEADBEEF" # supports specific gitref
+"vfox-backend:myplugin" = "https://github.com/jdx/vfox-npm"
 ```
 
+The plugin type prefix (e.g., `asdf:`, `vfox:` or `vfox-backend:`) is optional. If omitted, mise will fall back to
+either using `asdf` or `vfox` if the URL contains `vfox-` in the repo name.
+
 If you simply want to install a plugin from a specific URL once, it's better to use
-`mise plugin install plugin <GIT_URL>`. Add this section to `mise.toml` if you want
+`mise plugin install <NAME> <GIT_URL>`. Add this section to `mise.toml` if you want
 to share the plugin location/revision with other developers in your project.
 
 This is similar
 to [`MISE_SHORTHANDS`](https://github.com/jdx/mise#mise_shorthands_fileconfigmiseshorthandstoml)
 but doesn't require a separate file.
 
-### `[alias]` - Tool version aliases
+### `[tool_alias]` - Tool version aliases
+
+::: tip
+`[alias]` has been renamed to `[tool_alias]` to distinguish it from `[shell_alias]`.
+The old `[alias]` key still works but is deprecated.
+:::
 
 The following makes `mise install node@my_custom_node` install node-20.x
 this can also be specified in a [plugin](/dev-tools/aliases.md).
@@ -192,23 +235,68 @@ note adding an alias will also add a symlink, in this case:
 ```
 
 ```toml
+[tool_alias.node.versions]
 my_custom_node = '20'
 ```
+
+### `[shell_alias]` - Shell aliases
+
+Define shell aliases that are set when entering a directory and unset when leaving:
+
+```toml
+[shell_alias]
+ll = "ls -la"
+gs = "git status"
+dev = "npm run dev"
+```
+
+These work similar to environment variables—they're set dynamically based on your current directory.
+See [Shell Aliases](/shell-aliases) for more details.
 
 ### Minimum mise version
 
 Specify the minimum supported version of mise required for the configuration file.
-If the configuration file specifies a version of mise that is higher than
-the currently installed version, mise will error out.
+
+You can set a hard minimum (errors if unmet) or a soft minimum (warns and continues):
 
 ```toml
+# (equivalent to hard)
 min_version = '2024.11.1'
+
+# new object form
+min_version = { hard = '2024.11.1' }
+
+# soft recommendation
+min_version = { soft = '2024.11.1' }
+
+# both
+min_version = { hard = '2024.11.1', soft = '2024.9.0' }
 ```
+
+When a soft minimum is not met, mise will print a warning and (if available) show self-update instructions. When a hard minimum is not met, mise errors and shows self-update instructions.
+
+### Monorepo root <Badge type="warning" text="experimental" />
+
+Mark a configuration file as a monorepo root to enable target path syntax for tasks. Requires `MISE_EXPERIMENTAL=1`.
+
+```toml
+experimental_monorepo_root = true
+```
+
+When enabled:
+
+- Tasks in subdirectories are available with namespaced paths (e.g., `//projects/frontend:build`)
+- Subdirectory tasks use tools from parent configs
+- Tasks are only loaded when needed (e.g., when running them, or with `mise tasks ls --all`)
+- All descendant config files are **implicitly trusted** when the root is trusted
+- Eliminates the need to individually trust each subdirectory's configuration
+
+See [Monorepo Tasks](/tasks/monorepo) for detailed usage and examples.
 
 ### `mise.toml` schema
 
 - You can find the JSON schema for `mise.toml` in [schema/mise.json](https://github.com/jdx/mise/blob/main/schema/mise.json) or at <https://mise.jdx.dev/schema/mise.json>.
-- Some editors can load it automatically to provide autocompletion and validation for when editing a `mise.toml` file ([VSCode](https://code.visualstudio.com/docs/languages/json#_json-schemas-and-settings), [IntelliJ](https://www.jetbrains.com/help/idea/json.html#ws_json_using_schemas), [neovim](https://github.com/b0o/SchemaStore.nvim), etc.). It is also available in the [JSON schema store](https://www.schemastore.org/json/).
+- Some editors can load it automatically to provide autocompletion and validation for when editing a `mise.toml` file ([VSCode](https://code.visualstudio.com/docs/languages/json#_json-schemas-and-settings), [IntelliJ](https://www.jetbrains.com/help/idea/json.html#ws_json_using_schemas), [neovim](https://github.com/b0o/SchemaStore.nvim), etc.). It is also available in the [JSON schema store](https://www.schemastore.org/).
 - Note that for `included tasks` (see [task configuration](/tasks/task-configuration), there is another schema: <https://mise.jdx.dev/schema/mise-task.json>)
 
 ## Global config: `~/.config/mise/config.toml`
@@ -235,7 +323,7 @@ always_keep_install = false         # deleted on failure by default
 
 # configure how frequently (in minutes) to fetch updated plugin repository changes
 # this is updated whenever a new runtime is installed
-# (note: this isn't currently implemented but there are plans to add it: https://github.com/jdx/mise/issues/128)
+# (note: this isn't currently implemented but there are plans to add it: https://github.com/jdx/mise/discussions/6735)
 plugin_autoupdate_last_check_duration = '1 week' # set to 0 to disable updates
 
 # config files with these prefixes will be trusted by default
@@ -250,7 +338,7 @@ raw = false           # set to true to directly pipe plugins to stdin/stdout/std
 yes = false           # set to true to automatically answer yes to all prompts
 
 not_found_auto_install = true # see MISE_NOT_FOUND_AUTO_INSTALL
-task_output = "prefix" # see Tasks Runner for more information
+task.output = "prefix" # see Tasks Runner for more information
 paranoid = false       # see MISE_PARANOID
 
 shorthands_file = '~/.config/mise/shorthands.toml' # path to the shorthands file, see `MISE_SHORTHANDS_FILE`
@@ -262,7 +350,11 @@ env_file = '.env' # load env vars from a dotenv file, see `MISE_ENV_FILE`
 experimental = true # enable experimental features
 
 # configure messages displayed when entering directories with config files
-status = { missing_tools = "if_other_versions_installed", show_env = false, show_tools = false }
+status = {
+  missing_tools = "if_other_versions_installed",
+  show_env = false,
+  show_tools = false,
+}
 
 # "_" is a special key for information you'd like to put into mise.toml that mise will never parse
 [_]
@@ -322,24 +414,29 @@ other developers to use a specific tool like mise or asdf.
 They support aliases, which means you can have an `.nvmrc` file with `lts/hydrogen` and it will work
 in mise and nvm. Here are some of the supported idiomatic version files:
 
-| Plugin     | Idiomatic Files                       |
-| ---------- | ------------------------------------- |
-| atmos      | `.atmos-version`                      |
-| crystal    | `.crystal-version`                    |
-| elixir     | `.exenv-version`                      |
-| go         | `.go-version`                         |
-| java       | `.java-version`, `.sdkmanrc`          |
-| node       | `.nvmrc`, `.node-version`             |
-| opentofu   | `.opentofu-version`                   |
-| packer     | `.packer-version`                     |
-| python     | `.python-version`, `.python-versions` |
-| ruby       | `.ruby-version`, `Gemfile`            |
-| terraform  | `.terraform-version`, `main.tf`       |
-| terragrunt | `.terragrunt-version`                 |
-| terramate  | `.terramate-version`                  |
-| yarn       | `.yvmrc`                              |
+| Plugin     | Idiomatic Files                           |
+| ---------- | ----------------------------------------- |
+| atmos      | `.atmos-version`                          |
+| bun        | `.bun-version`, `package.json`            |
+| crystal    | `.crystal-version`                        |
+| deno       | `.deno-version`, `package.json`           |
+| dotnet     | `global.json`                             |
+| elixir     | `.exenv-version`                          |
+| go         | `.go-version`                             |
+| java       | `.java-version`, `.sdkmanrc`              |
+| node       | `.nvmrc`, `.node-version`, `package.json` |
+| npm        | `package.json`                            |
+| opentofu   | `.opentofu-version`                       |
+| packer     | `.packer-version`                         |
+| pnpm       | `package.json`                            |
+| python     | `.python-version`, `.python-versions`     |
+| ruby       | `.ruby-version`, `Gemfile`                |
+| terraform  | `.terraform-version`, `main.tf`           |
+| terragrunt | `.terragrunt-version`                     |
+| terramate  | `.terramate-version`                      |
+| yarn       | `.yvmrc`, `package.json`                  |
 
-In mise, these are enabled by default. However, in 2025.10.0 they will default to disabled (see <https://github.com/jdx/mise/discussions/4345>).
+In mise, these are disabled by default, see <https://github.com/jdx/mise/discussions/4345> for rationale.
 
 - `mise settings add idiomatic_version_file_enable_tools python` for a specific tool such as Python ([docs](/configuration/settings.html#idiomatic_version_file_enable_tools))
 
@@ -397,11 +494,12 @@ in rust
 
 This is used for temporary storage such as when installing tools.
 
-### `MISE_SYSTEM_DIR`
+### `MISE_SYSTEM_CONFIG_DIR`
 
 Default: `/etc/mise`
 
 This is the directory where mise stores system-wide configuration.
+`MISE_SYSTEM_DIR` is also supported as a legacy alias.
 
 ### `MISE_GLOBAL_CONFIG_FILE`
 
@@ -431,6 +529,12 @@ of what is set in `mise.toml`/`.tool-versions`.
 
 This is a list of paths that mise will automatically mark as
 trusted. They can be separated with `:`.
+
+### `MISE_CEILING_PATHS`
+
+This is a list of paths where mise will stop searching for
+configuration files and file tasks. This is useful to stop
+mise searching for files in slow loading directories. They are separated according to platform conventions for the PATH environment variable. On most Unix platforms, the separator is `:` and on Windows it is `;`.
 
 ### `MISE_LOG_LEVEL=trace|debug|info|warn|error`
 

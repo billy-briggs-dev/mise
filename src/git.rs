@@ -7,7 +7,6 @@ use gix::{self};
 use once_cell::sync::OnceCell;
 use xx::file;
 
-use crate::cmd;
 use crate::cmd::CmdLineRunner;
 use crate::config::Settings;
 use crate::file::touch_dir;
@@ -22,7 +21,7 @@ macro_rules! git_cmd {
     ( $dir:expr $(, $arg:expr )* $(,)? ) => {
         {
             let safe = format!("safe.directory={}", $dir.display());
-            cmd!("git", "-C", $dir, "-c", safe $(, $arg)*)
+            cmd!("git", "-C", $dir, "-c", safe, "-c", "core.autocrlf=false" $(, $arg)*)
         }
     }
 }
@@ -152,6 +151,8 @@ impl Git {
         let mut cmd = CmdLineRunner::new("git")
             .arg("clone")
             .arg("-q")
+            .arg("-c")
+            .arg("core.autocrlf=false")
             .arg("--depth")
             .arg("1")
             .arg(url)
@@ -168,6 +169,32 @@ impl Git {
         }
 
         cmd.execute()?;
+        Ok(())
+    }
+
+    pub fn update_submodules(&self) -> Result<()> {
+        debug!("updating submodules in {}", self.dir.display());
+
+        let exec = |cmd: Expression| match cmd.stderr_to_stdout().stdout_capture().unchecked().run()
+        {
+            Ok(res) => {
+                if res.status.success() {
+                    Ok(())
+                } else {
+                    Err(eyre!(
+                        "git failed: {cmd:?} {}",
+                        String::from_utf8(res.stdout).unwrap()
+                    ))
+                }
+            }
+            Err(err) => Err(eyre!("git failed: {cmd:?} {err:#}")),
+        };
+
+        exec(
+            git_cmd!(&self.dir, "submodule", "update", "--init", "--recursive")
+                .env("GIT_TERMINAL_PROMPT", "0"),
+        )?;
+
         Ok(())
     }
 
@@ -232,13 +259,12 @@ impl Git {
         if !self.exists() {
             return None;
         }
-        if let Ok(repo) = self.repo() {
-            if let Ok(remote) = repo.find_remote("origin") {
-                if let Some(url) = remote.url(gix::remote::Direction::Fetch) {
-                    trace!("remote url for {dir:?}: {url}");
-                    return Some(url.to_string());
-                }
-            }
+        if let Ok(repo) = self.repo()
+            && let Ok(remote) = repo.find_remote("origin")
+            && let Some(url) = remote.url(gix::remote::Direction::Fetch)
+        {
+            trace!("remote url for {dir:?}: {url}");
+            return Some(url.to_string());
         }
         let res = git_cmd_read!(&self.dir, "config", "--get", "remote.origin.url");
         match res {
@@ -258,6 +284,15 @@ impl Git {
             Some((url, _ref)) => (url.to_string(), Some(_ref.to_string())),
             None => (url.to_string(), None),
         }
+    }
+
+    pub fn remote_sha(&self, branch: &str) -> Result<Option<String>> {
+        let output = git_cmd_read!(&self.dir, "ls-remote", "origin", branch)?;
+        Ok(output
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .map(|sha| sha.to_string()))
     }
 
     pub fn exists(&self) -> bool {
@@ -285,12 +320,12 @@ impl Debug for Git {
 
 #[derive(Default)]
 pub struct CloneOptions<'a> {
-    pr: Option<&'a Box<dyn SingleReport>>,
+    pr: Option<&'a dyn SingleReport>,
     branch: Option<String>,
 }
 
 impl<'a> CloneOptions<'a> {
-    pub fn pr(mut self, pr: &'a Box<dyn SingleReport>) -> Self {
+    pub fn pr(mut self, pr: &'a dyn SingleReport) -> Self {
         self.pr = Some(pr);
         self
     }

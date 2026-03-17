@@ -4,17 +4,30 @@ use eyre::Result;
 use itertools::Itertools;
 
 use crate::cli::args::{BackendArg, ToolArg};
-use crate::config::Config;
+use crate::config::{Config, ConfigMap};
 use crate::env_diff::EnvMap;
 use crate::errors::Error;
-use crate::toolset::{ToolRequest, ToolSource, Toolset};
+use crate::toolset::{ResolveOptions, ToolRequest, ToolSource, Toolset};
 use crate::{config, env};
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    /// Include tools from all config files
+    #[default]
+    All,
+    /// Only include tools from local (non-global) config files
+    LocalOnly,
+    /// Only include tools from the global config file
+    GlobalOnly,
+}
 
 #[derive(Debug, Default)]
 pub struct ToolsetBuilder {
     args: Vec<ToolArg>,
-    global_only: bool,
+    scope: ConfigScope,
     default_to_latest: bool,
+    resolve_options: ResolveOptions,
+    config_files: Option<ConfigMap>,
 }
 
 impl ToolsetBuilder {
@@ -32,8 +45,19 @@ impl ToolsetBuilder {
         self
     }
 
-    pub fn with_global_only(mut self, global_only: bool) -> Self {
-        self.global_only = global_only;
+    pub fn with_scope(mut self, scope: ConfigScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn with_resolve_options(mut self, resolve_options: ResolveOptions) -> Self {
+        self.resolve_options = resolve_options;
+        self
+    }
+
+    /// Use custom config files instead of config.config_files
+    pub fn with_config_files(mut self, config_files: ConfigMap) -> Self {
+        self.config_files = Some(config_files);
         self
     }
 
@@ -45,13 +69,16 @@ impl ToolsetBuilder {
             self.load_config_files(config, &mut toolset)?;
         });
         measure!("toolset_builder::build::load_runtime_env", {
-            self.load_runtime_env(&mut toolset, env::vars().collect())?;
+            self.load_runtime_env(&mut toolset, env::vars_safe().collect())?;
         });
         measure!("toolset_builder::build::load_runtime_args", {
             self.load_runtime_args(&mut toolset)?;
         });
         measure!("toolset_builder::build::resolve", {
-            if let Err(err) = toolset.resolve(config).await {
+            if let Err(err) = toolset
+                .resolve_with_opts(config, &self.resolve_options)
+                .await
+            {
                 if Error::is_argument_err(&err) {
                     return Err(err);
                 }
@@ -64,9 +91,14 @@ impl ToolsetBuilder {
     }
 
     fn load_config_files(&self, config: &Arc<Config>, ts: &mut Toolset) -> eyre::Result<()> {
-        for cf in config.config_files.values().rev() {
-            if self.global_only && !config::is_global_config(cf.get_path()) {
-                continue;
+        let config_files = self.config_files.as_ref().unwrap_or(&config.config_files);
+
+        for cf in config_files.values().rev() {
+            let is_global = config::is_global_config(cf.get_path());
+            match self.scope {
+                ConfigScope::GlobalOnly if !is_global => continue,
+                ConfigScope::LocalOnly if is_global => continue,
+                _ => {}
             }
             ts.merge(cf.to_toolset()?);
         }
@@ -74,6 +106,10 @@ impl ToolsetBuilder {
     }
 
     fn load_runtime_env(&self, ts: &mut Toolset, env: EnvMap) -> eyre::Result<()> {
+        if self.scope == ConfigScope::LocalOnly {
+            // LocalOnly excludes env-based tool versions (MISE_*_VERSION).
+            return Ok(());
+        }
         for (k, v) in env {
             if k.starts_with("MISE_") && k.ends_with("_VERSION") && k != "MISE_VERSION" {
                 let plugin_name = k

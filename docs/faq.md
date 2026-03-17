@@ -24,15 +24,6 @@ something with the aliasing is acting up, submit a ticket or just stick to using
 Under the hood, when mise reads a config file or takes CLI input it will swap out "nodejs" and
 "golang".
 
-While this change is rolling out, there is some migration code that will move installs/plugins from
-the "nodejs" and "golang" directories to the new names. If this runs for you you'll see a message
-but it should not run again unless there is some kind of problem. In this case, it's probably
-easiest to just
-run
-`rm -rf ~/.local/share/mise/installs/{golang,nodejs} ~/.local/share/mise/plugins/{golang,nodejs}`.
-
-Once most users have migrated over this migration code will be removed.
-
 ## What does `mise activate` do?
 
 It registers a shell hook to run `mise hook-env` every time the shell prompt is displayed.
@@ -79,7 +70,7 @@ and `mise deactivate` to work without wrapping them in `eval "$(mise shell)"`.
 
 ::: warning
 While mise runs great in WSL, native Windows is also supported, though via the use of shims until
-someone adds [powershell](https://github.com/jdx/mise/issues/3451) support.
+someone adds [powershell](https://github.com/jdx/mise/discussions/6733) support.
 
 As you'll need to use shims, this means you won't have environment variables from mise.toml unless you run mise via
 [`mise x`](/cli/exec) or [`mise run`](/cli/run)—though that's actually how I use mise on my mac so
@@ -103,7 +94,7 @@ We maintain [an index](https://github.com/mise-plugins/registry) of shorthands t
 base.
 This is regularly updated every time that mise has a release. This repository is stored directly
 into
-the codebase in [registry.toml](https://github.com/jdx/mise/blob/main/registry.toml).
+the codebase in [registry/](https://github.com/jdx/mise/blob/main/registry/).
 
 ## Does "node@20" mean the newest available version of node?
 
@@ -201,8 +192,29 @@ Arguments, flags, environment variables, and config files can all be defined in 
 
 You can leverage usage in file tasks to get auto-completion working, see [file tasks arguments](/tasks/file-tasks.html#arguments).
 
+## What is pitchfork?
+
+pitchfork (<https://pitchfork.jdx.dev/>) is a process manager for developers.
+
+It handles daemon management with features like automatic restarts on failure, smart readiness checks, shell-based auto-start/stop when entering project directories, and cron-style scheduling for periodic tasks.
+
 ## VSCode for windows extension with error `spawn EINVAL`
 
 In VSCode, many extensions will throw an "error spawn EINVAL" due to a [Node.js security fix](https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2#command-injection-via-args-parameter-of-child_processspawn-without-shell-option-enabled-on-windows-cve-2024-27980---high).
 
-You can change [windows_shim_mode](https://mise.jdx.dev/configuration/settings.html#windows_shim_mode) to `hardlink` or `symlink`
+The default `exe` shim mode should resolve this. If you're using an older mode, you can change [windows_shim_mode](https://mise.jdx.dev/configuration/settings.html#windows_shim_mode) to `exe`, `hardlink`, or `symlink`.
+
+## How does mise versioning work?
+
+mise uses [Calver](https://calver.org/) versioning (`2024.1.0`).
+Breaking changes will be few but when they do happen,
+they will be communicated in the CLI with plenty of notice whenever possible.
+
+Rather than have SemVer major releases to communicate change in large releases,
+new functionality and changes can be opted-into with settings like `experimental = true`.
+This way plugin authors and users can
+test out new functionality immediately without waiting for a major release.
+
+The numbers in Calver (YYYY.MM.RELEASE) simply represent the date of the release—not compatibility
+or how many new features were added.
+Each release will be small and incremental.

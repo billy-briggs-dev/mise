@@ -6,6 +6,8 @@ import {
 } from "vitepress-plugin-group-icons";
 import { tabsMarkdownPlugin } from "vitepress-plugin-tabs";
 import { withMermaid } from "vitepress-plugin-mermaid";
+import kdlGrammar from "./grammars/kdl.tmLanguage.json";
+import miseTomlGrammar from "./grammars/mise-toml.tmLanguage.json";
 
 // https://vitepress.dev/reference/site-config
 export default withMermaid(
@@ -14,15 +16,17 @@ export default withMermaid(
     description: "mise-en-place documentation",
     lang: "en-US",
     lastUpdated: true,
-    appearance: "dark",
+    appearance: true,
     mermaid: {},
     sitemap: {
       hostname: "https://mise.jdx.dev",
     },
     themeConfig: {
       // https://vitepress.dev/reference/default-theme-config
+      logo: { light: "/logo-light.svg", dark: "/logo-dark.svg" },
       outline: "deep",
       nav: [
+        { text: "mise-versions", link: "https://mise-versions.jdx.dev/" },
         { text: "Dev Tools", link: "/dev-tools/" },
         { text: "Environments", link: "/environments/" },
         { text: "Tasks", link: "/tasks/" },
@@ -59,10 +63,11 @@ export default withMermaid(
               link: "/dev-tools/comparison-to-asdf",
             },
             { text: "Shims", link: "/dev-tools/shims" },
-            { text: "Aliases", link: "/dev-tools/aliases" },
+            { text: "Tool Aliases", link: "/dev-tools/aliases" },
             { text: "Tool Stubs", link: "/dev-tools/tool-stubs" },
             { text: "Registry", link: "/registry" },
             { text: "mise.lock Lockfile", link: "/dev-tools/mise-lock" },
+            { text: "Prepare", link: "/dev-tools/prepare" },
             {
               text: "Backend Architecture",
               link: "/dev-tools/backend_architecture",
@@ -94,7 +99,9 @@ export default withMermaid(
                 { text: "aqua", link: "/dev-tools/backends/aqua" },
                 { text: "asdf", link: "/dev-tools/backends/asdf" },
                 { text: "cargo", link: "/dev-tools/backends/cargo" },
+                { text: "conda", link: "/dev-tools/backends/conda" },
                 { text: "dotnet", link: "/dev-tools/backends/dotnet" },
+                { text: "forgejo", link: "/dev-tools/backends/forgejo" },
                 { text: "gem", link: "/dev-tools/backends/gem" },
                 { text: "github", link: "/dev-tools/backends/github" },
                 { text: "gitlab", link: "/dev-tools/backends/gitlab" },
@@ -113,7 +120,16 @@ export default withMermaid(
           text: "Environments",
           items: [
             { text: "Environment Variables", link: "/environments/" },
-            { text: "Secrets", link: "/environments/secrets" },
+            { text: "Shell Aliases", link: "/shell-aliases" },
+            {
+              text: "Secrets",
+              link: "/environments/secrets/",
+              collapsed: true,
+              items: [
+                { text: "sops", link: "/environments/secrets/sops" },
+                { text: "age", link: "/environments/secrets/age" },
+              ],
+            },
             { text: "Hooks", link: "/hooks" },
             { text: "direnv", link: "/direnv" },
           ],
@@ -126,7 +142,10 @@ export default withMermaid(
             { text: "Running Tasks", link: "/tasks/running-tasks" },
             { text: "TOML Tasks", link: "/tasks/toml-tasks" },
             { text: "File Tasks", link: "/tasks/file-tasks" },
+            { text: "Task Arguments", link: "/tasks/task-arguments" },
             { text: "Task Configuration", link: "/tasks/task-configuration" },
+            { text: "Task Templates", link: "/tasks/templates" },
+            { text: "Monorepo Tasks", link: "/tasks/monorepo" },
           ],
         },
         {
@@ -142,6 +161,10 @@ export default withMermaid(
               text: "Tool Plugin Development",
               link: "/tool-plugin-development",
             },
+            {
+              text: "Environment Plugin Development",
+              link: "/env-plugin-development",
+            },
             { text: "Plugin Lua Modules", link: "/plugin-lua-modules" },
             { text: "Plugin Publishing", link: "/plugin-publishing" },
             { text: "asdf (Legacy) Plugins", link: "/asdf-legacy-plugins" },
@@ -151,6 +174,7 @@ export default withMermaid(
           text: "About",
           items: [
             { text: "About mise", link: "/about" },
+            { text: "Glossary", link: "/glossary" },
             { text: "FAQs", link: "/faq" },
             { text: "Troubleshooting", link: "/troubleshooting" },
             { text: "Tips & Tricks", link: "/tips-and-tricks" },
@@ -170,7 +194,6 @@ export default withMermaid(
               ],
             },
             { text: "Team", link: "/team" },
-            { text: "Roadmap", link: "/roadmap" },
             { text: "Contributing", link: "/contributing" },
             { text: "External Resources", link: "/external-resources" },
           ],
@@ -181,6 +204,7 @@ export default withMermaid(
             { text: "Architecture", link: "/architecture" },
             { text: "Paranoid", link: "/paranoid" },
             { text: "Templates", link: "/templates" },
+            { text: "URL Replacements", link: "/url-replacements" },
             { text: "Model Context Protocol", link: "/mcp" },
             { text: "How I Use mise", link: "/how-i-use-mise" },
             { text: "Directory Structure", link: "/directories" },
@@ -225,6 +249,26 @@ export default withMermaid(
       },
     },
     markdown: {
+      languages: [
+        // Load base languages needed for embedded support
+        "toml",
+        "shell",
+        "bash",
+        // TODO: Once Shiki bundles KDL (tracked in shikijs/textmate-grammars-themes),
+        // we can import it from 'shiki/langs/kdl' instead of storing locally
+        {
+          ...kdlGrammar,
+          name: "kdl",
+          scopeName: "source.kdl",
+        } as any,
+        // Custom mise.toml grammar with embedded KDL (usage fields) and bash (run fields)
+        {
+          ...miseTomlGrammar,
+          name: "mise-toml",
+          aliases: ["mise.toml"],
+          scopeName: "source.mise-toml",
+        } as any,
+      ],
       config(md) {
         md.use(groupIconMdPlugin);
         md.use(tabsMarkdownPlugin);
@@ -244,6 +288,59 @@ export default withMermaid(
       ],
     },
     head: [
+      // Favicon
+      ["link", { rel: "icon", href: "/favicon.ico", sizes: "any" }],
+      [
+        "link",
+        {
+          rel: "icon",
+          href: "/favicon-16x16.png",
+          type: "image/png",
+          sizes: "16x16",
+        },
+      ],
+      [
+        "link",
+        {
+          rel: "icon",
+          href: "/favicon-32x32.png",
+          type: "image/png",
+          sizes: "32x32",
+        },
+      ],
+      ["link", { rel: "icon", href: "/logo.svg", type: "image/svg+xml" }],
+      [
+        "link",
+        {
+          rel: "apple-touch-icon",
+          href: "/apple-touch-icon.png",
+          sizes: "180x180",
+        },
+      ],
+      // Google Fonts
+      [
+        "link",
+        {
+          rel: "preconnect",
+          href: "https://fonts.googleapis.com",
+        },
+      ],
+      [
+        "link",
+        {
+          rel: "preconnect",
+          href: "https://fonts.gstatic.com",
+          crossorigin: "",
+        },
+      ],
+      [
+        "link",
+        {
+          href: "https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=JetBrains+Mono:wght@400;500;600;700&display=swap",
+          rel: "stylesheet",
+        },
+      ],
+      // Analytics
       [
         "script",
         {
@@ -265,6 +362,24 @@ export default withMermaid(
           "data-goatcounter": "https://jdx.goatcounter.com/count",
           async: "",
           src: "//gc.zgo.at/count.js",
+        },
+      ],
+      // OpenGraph
+      ["meta", { property: "og:site_name", content: "mise-en-place" }],
+      ["meta", { property: "og:type", content: "website" }],
+      [
+        "meta",
+        {
+          property: "og:image",
+          content: "https://mise.jdx.dev/android-chrome-512x512.png",
+        },
+      ],
+      ["meta", { name: "twitter:card", content: "summary" }],
+      [
+        "meta",
+        {
+          name: "twitter:image",
+          content: "https://mise.jdx.dev/android-chrome-512x512.png",
         },
       ],
     ],

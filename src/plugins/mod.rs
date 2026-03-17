@@ -1,6 +1,8 @@
 use crate::errors::Error::PluginNotInstalled;
+use crate::git::Git;
 use crate::plugins::asdf_plugin::AsdfPlugin;
 use crate::plugins::vfox_plugin::VfoxPlugin;
+use crate::registry::REGISTRY;
 use crate::toolset::install_state;
 use crate::ui::multi_progress_report::MultiProgressReport;
 use crate::ui::progress_report::SingleReport;
@@ -11,7 +13,7 @@ use eyre::{Result, eyre};
 use heck::ToKebabCase;
 use regex::Regex;
 pub use script_manager::{Script, ScriptManager};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock as Lazy;
 use std::vec;
 use std::{
@@ -96,6 +98,14 @@ impl PluginEnum {
         }
     }
 
+    pub fn remote_sha(&self) -> eyre::Result<Option<String>> {
+        match self {
+            PluginEnum::Asdf(plugin) => plugin.remote_sha(),
+            PluginEnum::Vfox(plugin) => plugin.remote_sha(),
+            PluginEnum::VfoxBackend(plugin) => plugin.remote_sha(),
+        }
+    }
+
     pub fn external_commands(&self) -> eyre::Result<Vec<Command>> {
         match self {
             PluginEnum::Asdf(plugin) => plugin.external_commands(),
@@ -112,11 +122,7 @@ impl PluginEnum {
         }
     }
 
-    pub async fn update(
-        &self,
-        pr: &Box<dyn SingleReport>,
-        gitref: Option<String>,
-    ) -> eyre::Result<()> {
+    pub async fn update(&self, pr: &dyn SingleReport, gitref: Option<String>) -> eyre::Result<()> {
         match self {
             PluginEnum::Asdf(plugin) => plugin.update(pr, gitref).await,
             PluginEnum::Vfox(plugin) => plugin.update(pr, gitref).await,
@@ -124,7 +130,7 @@ impl PluginEnum {
         }
     }
 
-    pub async fn uninstall(&self, pr: &Box<dyn SingleReport>) -> eyre::Result<()> {
+    pub async fn uninstall(&self, pr: &dyn SingleReport) -> eyre::Result<()> {
         match self {
             PluginEnum::Asdf(plugin) => plugin.uninstall(pr).await,
             PluginEnum::Vfox(plugin) => plugin.uninstall(pr).await,
@@ -132,11 +138,7 @@ impl PluginEnum {
         }
     }
 
-    pub async fn install(
-        &self,
-        config: &Arc<Config>,
-        pr: &Box<dyn SingleReport>,
-    ) -> eyre::Result<()> {
+    pub async fn install(&self, config: &Arc<Config>, pr: &dyn SingleReport) -> eyre::Result<()> {
         match self {
             PluginEnum::Asdf(plugin) => plugin.install(config, pr).await,
             PluginEnum::Vfox(plugin) => plugin.install(config, pr).await,
@@ -165,11 +167,14 @@ impl PluginEnum {
         config: &Arc<Config>,
         mpr: &MultiProgressReport,
         force: bool,
+        dry_run: bool,
     ) -> eyre::Result<()> {
         match self {
-            PluginEnum::Asdf(plugin) => plugin.ensure_installed(config, mpr, force).await,
-            PluginEnum::Vfox(plugin) => plugin.ensure_installed(config, mpr, force).await,
-            PluginEnum::VfoxBackend(plugin) => plugin.ensure_installed(config, mpr, force).await,
+            PluginEnum::Asdf(plugin) => plugin.ensure_installed(config, mpr, force, dry_run).await,
+            PluginEnum::Vfox(plugin) => plugin.ensure_installed(config, mpr, force, dry_run).await,
+            PluginEnum::VfoxBackend(plugin) => {
+                plugin.ensure_installed(config, mpr, force, dry_run).await
+            }
         }
     }
 }
@@ -196,9 +201,22 @@ impl PluginType {
     }
 }
 
+/// Warn if a plugin is an env-only vfox plugin that shadows a registry entry.
+/// Env-only plugins have `hooks/mise_env.lua` but not `hooks/available.lua`.
+pub fn warn_if_env_plugin_shadows_registry(name: &str, plugin_path: &Path) {
+    let hooks = plugin_path.join("hooks");
+    let is_env_only = hooks.join("mise_env.lua").exists() && !hooks.join("available.lua").exists();
+    if is_env_only && REGISTRY.contains_key(name) {
+        warn!(
+            "plugin '{name}' is an env plugin and is shadowing the '{name}' registry tool - \
+            consider renaming the plugin or removing it with: mise plugins rm {name}"
+        );
+    }
+}
+
 pub static VERSION_REGEX: Lazy<regex::Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)(^Available versions:|-src|-dev|-latest|-stm|[-\\.]rc|-milestone|-alpha|-beta|[-\\.]pre|-next|([abc])[0-9]+|snapshot|SNAPSHOT|master)"
+        r"(?i)(^Available versions:|-src|-dev|-latest|-stm|[-\\.]rc|-milestone|-alpha|-beta|[-\\.]pre|-next|-test|([abc])[0-9]+|snapshot|SNAPSHOT|master)"
     )
         .unwrap()
 });
@@ -236,6 +254,9 @@ pub trait Plugin: Debug + Send {
     fn set_remote_url(&self, url: String) {}
     fn current_abbrev_ref(&self) -> eyre::Result<Option<String>>;
     fn current_sha_short(&self) -> eyre::Result<Option<String>>;
+    fn remote_sha(&self) -> eyre::Result<Option<String>> {
+        Ok(None)
+    }
     fn is_installed(&self) -> bool {
         true
     }
@@ -251,24 +272,17 @@ pub trait Plugin: Debug + Send {
         _config: &Arc<Config>,
         _mpr: &MultiProgressReport,
         _force: bool,
+        _dry_run: bool,
     ) -> eyre::Result<()> {
         Ok(())
     }
-    async fn update(
-        &self,
-        _pr: &Box<dyn SingleReport>,
-        _gitref: Option<String>,
-    ) -> eyre::Result<()> {
+    async fn update(&self, _pr: &dyn SingleReport, _gitref: Option<String>) -> eyre::Result<()> {
         Ok(())
     }
-    async fn uninstall(&self, _pr: &Box<dyn SingleReport>) -> eyre::Result<()> {
+    async fn uninstall(&self, _pr: &dyn SingleReport) -> eyre::Result<()> {
         Ok(())
     }
-    async fn install(
-        &self,
-        _config: &Arc<Config>,
-        _pr: &Box<dyn SingleReport>,
-    ) -> eyre::Result<()> {
+    async fn install(&self, _config: &Arc<Config>, _pr: &dyn SingleReport) -> eyre::Result<()> {
         Ok(())
     }
     fn external_commands(&self) -> eyre::Result<Vec<Command>> {
@@ -306,5 +320,110 @@ impl Eq for PluginEnum {}
 impl Display for PluginEnum {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PluginSource {
+    /// Git repository with URL and optional ref
+    Git {
+        url: String,
+        git_ref: Option<String>,
+    },
+    /// Zip file accessible via HTTPS
+    Zip { url: String },
+}
+
+impl PluginSource {
+    pub fn parse(repository: &str) -> Self {
+        // Split Parameters
+        let url_path = repository
+            .split('?')
+            .next()
+            .unwrap_or(repository)
+            .split('#')
+            .next()
+            .unwrap_or(repository);
+        // Check if it's a zip file (ends with -zip)
+        if url_path.to_lowercase().ends_with(".zip") {
+            return PluginSource::Zip {
+                url: repository.to_string(),
+            };
+        }
+        // Otherwise treat as git repository
+        let (url, git_ref) = Git::split_url_and_ref(repository);
+        PluginSource::Git {
+            url: url.to_string(),
+            git_ref: git_ref.map(|s| s.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plugin_source_parse_git() {
+        // Test parsing Git URL
+        let source = PluginSource::parse("https://github.com/user/plugin.git");
+        match source {
+            PluginSource::Git { url, git_ref } => {
+                assert_eq!(url, "https://github.com/user/plugin.git");
+                assert_eq!(git_ref, None);
+            }
+            _ => panic!("Expected a git plugin"),
+        }
+    }
+
+    #[test]
+    fn test_plugin_source_parse_git_with_ref() {
+        // Test parsing Git URL with refs
+        let source = PluginSource::parse("https://github.com/user/plugin.git#v1.0.0");
+        match source {
+            PluginSource::Git { url, git_ref } => {
+                assert_eq!(url, "https://github.com/user/plugin.git");
+                assert_eq!(git_ref, Some("v1.0.0".to_string()));
+            }
+            _ => panic!("Expected a git plugin"),
+        }
+    }
+
+    #[test]
+    fn test_plugin_source_parse_zip() {
+        // Test parsing zip URL
+        let source = PluginSource::parse("https://example.com/plugins/my-plugin.zip");
+        match source {
+            PluginSource::Zip { url } => {
+                assert_eq!(url, "https://example.com/plugins/my-plugin.zip");
+            }
+            _ => panic!("Expected a Zip source"),
+        }
+    }
+
+    #[test]
+    fn test_plugin_source_parse_uppercase_zip_with_query() {
+        // Test parsing zip URL with query
+        let source =
+            PluginSource::parse("https://example.com/plugins/my-plugin.ZIP?version=v1.0.0");
+        match source {
+            PluginSource::Zip { url } => {
+                assert_eq!(
+                    url,
+                    "https://example.com/plugins/my-plugin.ZIP?version=v1.0.0"
+                );
+            }
+            _ => panic!("Expected a Zip source"),
+        }
+    }
+
+    #[test]
+    fn test_plugin_source_parse_edge_cases() {
+        // Test parsing git url which contains `.zip`
+        let source = PluginSource::parse("https://example.com/.zip/plugin");
+        match source {
+            PluginSource::Git { .. } => {}
+            _ => panic!("Expected a git plugin"),
+        }
     }
 }

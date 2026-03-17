@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::dirs;
 use crate::file;
 use crate::hash;
+use crate::lockfile::PlatformInfo;
 use crate::toolset::{InstallOptions, ToolRequest, ToolSource, ToolVersionOptions};
 use clap::Parser;
 use color_eyre::eyre::{Result, bail, eyre};
@@ -23,21 +24,31 @@ pub struct ToolStubFile {
     pub install_env: indexmap::IndexMap<String, String>,
     #[serde(default)]
     pub os: Option<Vec<String>>,
+    pub lock: Option<ToolStubLock>,
     #[serde(flatten, deserialize_with = "deserialize_tool_stub_options")]
-    pub opts: indexmap::IndexMap<String, String>,
+    pub opts: indexmap::IndexMap<String, toml::Value>,
     #[serde(skip)]
     pub tool_name: String,
 }
 
-// Custom deserializer that converts TOML values to strings for storage in opts
+#[derive(Debug, Deserialize)]
+pub struct ToolStubLock {
+    pub platforms: BTreeMap<String, ToolStubLockPlatform>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToolStubLockPlatform {
+    pub url: Option<String>,
+    pub checksum: Option<String>,
+}
+
+// Custom deserializer that keeps TOML values native, converting scalars to strings
 fn deserialize_tool_stub_options<'de, D>(
     deserializer: D,
-) -> Result<indexmap::IndexMap<String, String>, D::Error>
+) -> Result<indexmap::IndexMap<String, toml::Value>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    use serde::de::Error;
-
     let value = Value::deserialize(deserializer)?;
     let mut opts = indexmap::IndexMap::new();
 
@@ -46,25 +57,18 @@ where
             // Skip known special fields that are handled separately
             if matches!(
                 key.as_str(),
-                "version" | "bin" | "tool" | "install_env" | "os"
+                "version" | "bin" | "tool" | "install_env" | "os" | "lock"
             ) {
                 continue;
             }
 
-            // Convert TOML values to strings for storage
-            let string_value = match val {
-                Value::String(s) => s,
-                Value::Table(_) | Value::Array(_) => {
-                    // For complex values (tables, arrays), serialize them as TOML strings
-                    toml::to_string(&val).map_err(D::Error::custom)?
-                }
-                Value::Integer(i) => i.to_string(),
-                Value::Float(f) => f.to_string(),
-                Value::Boolean(b) => b.to_string(),
-                Value::Datetime(dt) => dt.to_string(),
+            let stored_value = match val {
+                Value::String(_) | Value::Table(_) | Value::Array(_) => val,
+                // Convert scalar values (ints, bools, floats) to strings
+                _ => Value::String(val.to_string().trim_matches('"').to_string()),
             };
 
-            opts.insert(key, string_value);
+            opts.insert(key, stored_value);
         }
     }
 
@@ -75,7 +79,7 @@ fn default_version() -> String {
     "latest".to_string()
 }
 
-fn has_http_backend_config(opts: &indexmap::IndexMap<String, String>) -> bool {
+fn has_http_backend_config(opts: &indexmap::IndexMap<String, toml::Value>) -> bool {
     // Check for top-level url
     if opts.contains_key("url") {
         return true;
@@ -83,43 +87,93 @@ fn has_http_backend_config(opts: &indexmap::IndexMap<String, String>) -> bool {
 
     // Check for platform-specific configs with urls
     for (key, value) in opts {
-        if key.starts_with("platforms") && value.contains("url") {
-            return true;
+        if key.starts_with("platforms") {
+            // Check if the value is a table containing url keys
+            if let toml::Value::Table(table) = value {
+                for (_, v) in table {
+                    if let toml::Value::Table(inner) = v
+                        && inner.contains_key("url")
+                    {
+                        return true;
+                    }
+                }
+            } else if let toml::Value::String(s) = value
+                && s.contains("url")
+            {
+                return true;
+            }
         }
     }
 
     false
 }
 
+/// Extract TOML content from a bootstrap script's comment block
+/// Looks for content between `# MISE_TOOL_STUB:` and `# :MISE_TOOL_STUB` markers
+fn extract_toml_from_bootstrap(content: &str) -> Option<String> {
+    let start_marker = "# MISE_TOOL_STUB:";
+    let end_marker = "# :MISE_TOOL_STUB";
+
+    let start_pos = content.find(start_marker)?;
+    let end_pos = content.find(end_marker)?;
+
+    if start_pos >= end_pos {
+        return None;
+    }
+
+    // Extract content between markers (skip the start marker line)
+    let between = &content[start_pos + start_marker.len()..end_pos];
+
+    // Remove leading `# ` from each line to get the original TOML
+    let toml = between
+        .lines()
+        .map(|line| line.strip_prefix("# ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(toml.trim().to_string())
+}
+
 impl ToolStubFile {
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = file::read_to_string(path)?;
-        let mut stub: ToolStubFile = toml::from_str(&content)?;
-
-        // Extract stub name from file name
         let stub_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| eyre!("Invalid stub file name"))?
             .to_string();
 
+        // Check if this is a bootstrap script with embedded TOML
+        let toml_content = if let Some(toml) = extract_toml_from_bootstrap(&content) {
+            toml
+        } else {
+            content
+        };
+
+        let mut stub: ToolStubFile = toml::from_str(&toml_content)?;
+
         // Determine tool name from tool field or derive from stub name
         // If no tool is specified, default to HTTP backend if HTTP config is present
         let tool_name = stub
             .tool
             .clone()
-            .or_else(|| stub.opts.get("tool").map(|s| s.to_string()))
+            .or_else(|| {
+                stub.opts
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| {
                 if has_http_backend_config(&stub.opts) {
                     format!("http:{stub_name}")
                 } else {
-                    stub_name.clone()
+                    stub_name.to_string()
                 }
             });
 
         // Set bin to filename if not specified
         if stub.bin.is_none() {
-            stub.bin = Some(stub_name.clone());
+            stub.bin = Some(stub_name.to_string());
         }
 
         stub.tool_name = tool_name;
@@ -131,7 +185,7 @@ impl ToolStubFile {
     pub fn to_tool_request(&self, stub_path: &Path) -> Result<ToolRequest> {
         use crate::cli::args::BackendArg;
 
-        let backend_arg = BackendArg::from(&self.tool_name);
+        let mut backend_arg = BackendArg::from(&self.tool_name);
         let source = ToolSource::ToolStub(stub_path.to_path_buf());
 
         // Create ToolVersionOptions from our fields
@@ -140,23 +194,26 @@ impl ToolStubFile {
 
         // Add bin field if present
         if let Some(bin) = &self.bin {
-            opts.insert("bin".to_string(), bin.clone());
+            opts.insert("bin".to_string(), toml::Value::String(bin.clone()));
         }
 
         let options = ToolVersionOptions {
             os: self.os.clone(),
             install_env: self.install_env.clone(),
-            opts: opts.clone(),
+            opts,
         };
+
+        // Set options on the BackendArg so they're available to the backend
+        backend_arg.set_opts(Some(options.clone()));
 
         // For HTTP backend with "latest" version, use URL+checksum hash as version for stability
         let version = if self.tool_name.starts_with("http:") && self.version == "latest" {
-            if let Some(url) =
-                lookup_platform_key(&options, "url").or_else(|| opts.get("url").cloned())
+            if let Some(url) = lookup_platform_key(&options, "url")
+                .or_else(|| options.get("url").map(|s| s.to_string()))
             {
                 // Include checksum in hash calculation for better version stability
                 let checksum = lookup_platform_key(&options, "checksum")
-                    .or_else(|| opts.get("checksum").cloned())
+                    .or_else(|| options.get("checksum").map(|s| s.to_string()))
                     .unwrap_or_default();
                 let hash_input = format!("{url}:{checksum}");
                 // Use first 8 chars of URL+checksum hash as version
@@ -235,7 +292,7 @@ fn find_tool_version(
     tool_name: &str,
 ) -> Option<crate::toolset::ToolVersion> {
     for (_backend, tv) in toolset.list_current_installed_versions(config) {
-        if tv.ba().full() == tool_name {
+        if tv.ba().short == tool_name {
             return Some(tv);
         }
     }
@@ -355,9 +412,11 @@ fn resolve_platform_specific_bin(stub: &ToolStubFile, stub_path: &Path) -> Strin
     let platform_key = get_current_platform_key();
 
     // Check for platform-specific bin field: platforms.{platform}.bin
-    let platform_bin_key = format!("platforms.{platform_key}.bin");
-    if let Some(platform_bin) = stub.opts.get(&platform_bin_key) {
-        return platform_bin.to_string();
+    if let Some(toml::Value::Table(platforms)) = stub.opts.get("platforms")
+        && let Some(toml::Value::Table(platform)) = platforms.get(&platform_key)
+        && let Some(toml::Value::String(bin)) = platform.get("bin")
+    {
+        return bin.clone();
     }
 
     // Fall back to global bin field
@@ -461,6 +520,23 @@ async fn execute_with_tool_request(
     // Resolve the toolset to populate current versions
     toolset.resolve(config).await?;
 
+    // Inject lock data from stub into tool versions
+    // The toolset contains only the single tool from this stub, so apply to all versions
+    if let Some(lock) = &stub.lock {
+        for (_ba, tvl) in toolset.versions.iter_mut() {
+            for tv in &mut tvl.versions {
+                for (platform_key, lock_platform) in &lock.platforms {
+                    let pi = PlatformInfo {
+                        url: lock_platform.url.clone(),
+                        checksum: lock_platform.checksum.clone(),
+                        ..Default::default()
+                    };
+                    tv.lock_platforms.insert(platform_key.clone(), pi);
+                }
+            }
+        }
+    }
+
     // Ensure we have current versions after resolving
     ensure!(
         !toolset.list_current_versions().is_empty(),
@@ -477,16 +553,32 @@ async fn execute_with_tool_request(
         ..Default::default()
     };
 
-    toolset
+    let (_, missing) = toolset
         .install_missing_versions(config, &install_opts)
         .await?;
-    toolset.notify_if_versions_missing(config).await;
+    toolset.notify_missing_versions(missing);
 
     // Find the binary path using cache
     match find_cached_or_resolve_bin_path(&toolset, &*config, stub, stub_path).await? {
         Ok(bin_path) => {
             // Get the environment with proper PATH from toolset
-            let env = toolset.env_with_path(config).await?;
+            let mut env = toolset.env_with_path(config).await?;
+            let mut path_env = crate::path_env::PathEnv::from_iter(crate::env::PATH.clone());
+            for p in toolset.list_paths(config).await {
+                path_env.add(p);
+            }
+
+            if let Some((backend, _tv)) = toolset.list_current_installed_versions(config).first() {
+                let btp = backend
+                    .dependency_toolset(config)
+                    .await?
+                    .list_paths(config)
+                    .await;
+                for p in btp {
+                    path_env.add(p);
+                }
+            }
+            env.insert(crate::env::PATH_KEY.to_string(), path_env.to_string());
 
             crate::cli::exec::exec_program(bin_path, args, env)
         }
@@ -570,7 +662,8 @@ impl ToolStub {
         // Find our file in the global args and take everything after it
         let args = {
             let global_args = crate::env::ARGS.read().unwrap();
-            if let Some(file_pos) = global_args.iter().position(|arg| arg == file_str.as_ref()) {
+            let file_str_ref: &str = file_str.as_ref();
+            if let Some(file_pos) = global_args.iter().position(|arg| arg == file_str_ref) {
                 global_args.get(file_pos + 1..).unwrap_or(&[]).to_vec()
             } else {
                 vec![]
@@ -579,6 +672,7 @@ impl ToolStub {
 
         let stub = ToolStubFile::from_file(&self.file)?;
         let mut config = Config::get().await?;
+
         return execute_with_tool_request(&stub, &mut config, args, &self.file).await;
     }
 }

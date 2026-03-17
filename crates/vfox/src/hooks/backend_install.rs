@@ -1,13 +1,17 @@
-use mlua::{prelude::LuaError, FromLua, IntoLua, Lua, Value};
+use indexmap::IndexMap;
 use std::path::PathBuf;
 
-use crate::{error::Result, Plugin};
+use mlua::{FromLua, IntoLua, Lua, LuaSerdeExt, Value, prelude::LuaError};
+
+use crate::{Plugin, error::Result};
 
 #[derive(Debug)]
 pub struct BackendInstallContext {
     pub tool: String,
     pub version: String,
     pub install_path: PathBuf,
+    pub download_path: PathBuf,
+    pub options: IndexMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -36,6 +40,11 @@ impl IntoLua for BackendInstallContext {
             "install_path",
             self.install_path.to_string_lossy().to_string(),
         )?;
+        table.set(
+            "download_path",
+            self.download_path.to_string_lossy().to_string(),
+        )?;
+        table.set("options", lua.to_value(&self.options)?)?;
         Ok(Value::Table(table))
     }
 }

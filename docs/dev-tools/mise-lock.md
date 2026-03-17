@@ -1,6 +1,6 @@
-# mise.lock Lockfile <Badge type="warning" text="experimental" />
+# mise.lock Lockfile
 
-`mise.lock` is a lockfile that pins exact versions and checksums of tools for reproducible environments. When enabled, mise will automatically maintain this file to ensure consistent tool versions across different machines and deployments.
+`mise.lock` is a lockfile that pins exact versions and checksums of tools for reproducible environments. Lockfiles are not created automatically—you must run `mise lock` to generate them. Once a lockfile exists, mise will keep it updated as tools are installed or upgraded.
 
 ## Overview
 
@@ -26,7 +26,7 @@ lockfile = true
 
 ## How It Works
 
-1. **Automatic Creation**: When you run `mise install` or `mise use`, mise updates `mise.lock` with the exact versions installed
+1. **Lockfile Updates**: Once a `mise.lock` file exists, running `mise install` or `mise use` updates it with the exact versions installed
 2. **Version Resolution**: If a `mise.lock` exists, mise will prefer locked versions over version ranges in `mise.toml`
 3. **Checksum Verification**: For supported backends, mise stores and verifies checksums of downloaded tools
 
@@ -36,7 +36,7 @@ lockfile = true
 
 ```toml
 # Example mise.lock
-[tools.node]
+[[tools.node]]
 version = "20.11.0"
 backend = "core:node"
 
@@ -45,7 +45,7 @@ checksum = "sha256:a6c213b7a2c3b8b9c0aaf8d7f5b3a5c8d4e2f4a5b6c7d8e9f0a1b2c3d4e5f
 size = 23456789
 url = "https://nodejs.org/dist/v20.11.0/node-v20.11.0-linux-x64.tar.xz"
 
-[tools.python]
+[[tools.python]]
 version = "3.11.7"
 backend = "core:python"
 
@@ -53,13 +53,16 @@ backend = "core:python"
 checksum = "sha256:def456..."
 size = 12345678
 
-[tools.ripgrep]
+# Tool with backend-specific options
+[[tools.ripgrep]]
 version = "14.1.1"
 backend = "aqua:BurntSushi/ripgrep"
+options = { exe = "rg" }
 
 [tools.ripgrep.platforms.linux-x64]
 checksum = "sha256:4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e"
 size = 1234567
+
 ```
 
 ### Platform Information
@@ -70,6 +73,15 @@ Each platform in a tool's `[tools.name.platforms]` section uses a key format lik
 - **`size`** (optional): File size in bytes for download validation
 - **`url`** (optional): Original download URL for reference or re-downloading
 
+### Tool Entry Fields
+
+Each tool entry (`[[tools.name]]`) can contain:
+
+- **`version`** (required): The exact version of the tool
+- **`backend`** (optional): The backend used to install the tool (e.g., `core:node`, `aqua:BurntSushi/ripgrep`)
+- **`options`** (optional): Backend-specific options that identify the artifact (e.g., `{exe = "rg", matching = "musl"}`)
+- **`platforms`** (optional): Platform-specific metadata (checksums, URLs, sizes)
+
 ### Platform Keys
 
 The platform key format is generally `os-arch` but can be customized by backends:
@@ -78,19 +90,81 @@ The platform key format is generally `os-arch` but can be customized by backends
 - **Backend-specific**: Some backends like Java may use more specific platform identifiers
 - **Tool-specific**: Backends like `ubi` may include additional tool-specific information in the platform key
 
-### Legacy Format Migration
+## Environment-Specific Lockfiles
 
-Older lockfiles with separate `[tools.name.assets]` and `[tools.name.checksums]` sections are automatically migrated to the new platform-based `[tools.name.platforms]` format when read. The migration is seamless and maintains all existing functionality.
+When using [environment-specific configuration files](/configuration/environments) (e.g., `mise.test.toml`), each environment gets its own lockfile:
+
+| Config file            | Lockfile               |
+| ---------------------- | ---------------------- |
+| `mise.toml`            | `mise.lock`            |
+| `mise.test.toml`       | `mise.test.lock`       |
+| `mise.staging.toml`    | `mise.staging.lock`    |
+| `mise.local.toml`      | `mise.local.lock`      |
+| `mise.test.local.toml` | `mise.test.local.lock` |
+
+For example, with `MISE_ENV=test`:
+
+```sh
+MISE_ENV=test mise lock  # creates mise.lock AND mise.test.lock
+```
+
+Tools from `mise.toml` go to `mise.lock`, tools from `mise.test.toml` go to `mise.test.lock`.
+
+**Resolution**: When `MISE_ENV=test`, mise reads `mise.test.lock` for tools defined in `mise.test.toml` and `mise.lock` for tools in `mise.toml`. Environment-specific lockfiles are strictly scoped to their corresponding config — they only contain tools defined in that config.
+
+This design means CI environments that don't set `MISE_ENV` only depend on `mise.lock`, so dev tool version bumps in `mise.dev.lock` won't invalidate CI caches.
+
+Both `mise.lock` and `mise.<env>.lock` files should be committed to version control. `mise.local.lock` and `mise.<env>.local.lock` should be gitignored alongside their corresponding config files.
+
+## Local Lockfiles
+
+Tools defined in `mise.local.toml` (which is typically gitignored) use a separate `mise.local.lock` file. This keeps local tool configurations separate from the committed lockfile.
+
+```sh
+# mise.local.toml tools go to mise.local.lock
+mise use --path mise.local.toml node@22
+
+# Regular mise.toml tools go to mise.lock
+mise use --path mise.toml node@20
+```
+
+Use `mise lock --local` to update the local lockfile for all platforms:
+
+```sh
+mise lock --local              # update mise.local.lock
+mise lock --local node python  # update specific tools in mise.local.lock
+```
+
+## Strict Lockfile Mode
+
+The `locked` setting enforces that all tools have pre-resolved URLs in the lockfile before installation. This prevents API calls to GitHub, aqua registry, etc., ensuring fully reproducible installations.
+
+```sh
+# Enable strict mode
+mise settings locked=true
+
+# Or via environment variable
+MISE_LOCKED=1 mise install
+```
+
+When enabled, `mise install` will fail if a tool doesn't have a URL for the current platform in the lockfile. To fix this, first populate the lockfile with URLs:
+
+```sh
+mise lock                    # generate URLs for all platforms
+mise lock --platform linux-x64,macos-arm64  # or specific platforms
+```
+
+This is useful for CI environments where you want to guarantee reproducible builds without any external API dependencies.
 
 ## Workflow
 
 ### Initial Setup
 
 ```sh
-# Create the lockfile
-touch mise.lock
+# Generate the lockfile
+mise lock
 
-# Install tools (this will populate the lockfile)
+# Install tools using locked versions
 mise install
 ```
 
@@ -110,7 +184,7 @@ When you want to update tool versions:
 
 ```sh
 # Update tool version in mise.toml
-mise use node@22
+mise use node@24
 
 # This will update both the installation and mise.lock
 ```
@@ -120,6 +194,8 @@ mise use node@22
 Backend support for lockfile features varies:
 
 - ✅ **Full support** (version + checksum + size + URL): `aqua`, `http`, `github`, `gitlab`
+  - _Provenance support_: `aqua`, `github`, `core:ruby` (precompiled binaries), `core:zig` (install-time)
+- ⚠️ **Partial support** (version + URL + provenance): `vfox` (tool plugins only)
 - ⚠️ **Partial support** (version + checksum + size): `ubi`
 - 📝 **Basic support** (version + checksum): `core` (some tools)
 - 📝 **Version only**: `asdf`, `npm`, `cargo`, `pipx`
@@ -149,9 +225,9 @@ git commit -m "Update tool versions"
 - name: Install tools
   run: |
     mise install  # Uses exact versions from mise.lock
-    
+
 - name: Cache lockfile
-  uses: actions/cache@v3
+  uses: actions/cache@v5
   with:
     key: mise-lock-${{ hashFiles('mise.lock') }}
 ```
@@ -192,8 +268,9 @@ lockfile = false
 # Convert .tool-versions to mise.toml
 mise config generate
 
-# Enable lockfiles and populate
+# Enable lockfiles and generate the lockfile
 mise settings lockfile=true
+mise lock
 mise install
 ```
 
@@ -203,30 +280,6 @@ mise install
 # Set versions based on package.json
 mise use node@$(jq -r '.engines.node' package.json)
 ```
-
-## Experimental Features
-
-Since lockfiles are still experimental, enable them with:
-
-```sh
-mise settings experimental=true
-mise settings lockfile=true
-```
-
-## Benefits of the New Format
-
-The platform-based format provides several advantages:
-
-1. **Organized Structure**: Platform information is logically grouped by operating system and architecture
-2. **Cross-platform Support**: Each tool can have different assets for different platforms in the same lockfile
-3. **Reduced Duplication**: Platform-specific checksums and sizes are consolidated per platform
-4. **Extended Metadata**: Support for file sizes and download URLs per platform
-5. **Better Maintainability**: Clear separation of tool versions and their platform-specific assets
-6. **Easier Navigation**: Platform-specific assets are easier to locate and manage by os-arch keys
-7. **Full Traceability**: URLs provide complete audit trail of asset sources per platform
-8. **Enhanced Security**: Better compliance and security auditing capabilities across platforms
-9. **Avoids Rate Limits**: By storing URLs, future installs do not need to make API calls to GitHub or other providers, reducing the risk of hitting rate limits and removing the need for `GITHUB_TOKEN` in simple workflows
-10. **Backend Flexibility**: Backends can customize platform keys for tool-specific requirements (e.g., Java's detailed platform specifications)
 
 ## See Also
 

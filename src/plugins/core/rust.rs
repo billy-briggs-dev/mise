@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
 use crate::build_time::TARGET;
 use crate::cli::args::BackendArg;
 use crate::cmd::CmdLineRunner;
@@ -10,7 +11,7 @@ use crate::http::HTTP;
 use crate::install_context::InstallContext;
 use crate::toolset::ToolSource::IdiomaticVersionFile;
 use crate::toolset::outdated_info::OutdatedInfo;
-use crate::toolset::{ToolVersion, Toolset};
+use crate::toolset::{ResolveOptions, ToolVersion, Toolset};
 use crate::ui::progress_report::SingleReport;
 use crate::{dirs, env, file, github, plugins};
 use async_trait::async_trait;
@@ -35,18 +36,21 @@ impl RustPlugin {
             return Ok(());
         }
         ctx.pr.set_message("Downloading rustup-init".into());
-        HTTP.download_file(rustup_url(&settings), &rustup_path(), Some(&ctx.pr))
+        HTTP.download_file(rustup_url(&settings), &rustup_path(), Some(ctx.pr.as_ref()))
             .await?;
         file::make_executable(rustup_path())?;
         file::create_dir_all(rustup_home())?;
         let ts = ctx.config.get_toolset().await?;
-        let cmd = CmdLineRunner::new(rustup_path())
-            .with_pr(&ctx.pr)
+        let mut cmd = CmdLineRunner::new(rustup_path())
+            .with_pr(ctx.pr.as_ref())
             .arg("--no-modify-path")
             .arg("--default-toolchain")
             .arg("none")
             .arg("-y")
             .envs(self.exec_env(&ctx.config, ts, tv).await?);
+        if let Some(host) = settings.rust.default_host.as_ref() {
+            cmd = cmd.arg("--default-host").arg(host);
+        }
         cmd.execute()?;
         Ok(())
     }
@@ -55,7 +59,7 @@ impl RustPlugin {
         ctx.pr.set_message(format!("{RUSTC_BIN} -V"));
         let ts = ctx.config.get_toolset().await?;
         CmdLineRunner::new(RUSTC_BIN)
-            .with_pr(&ctx.pr)
+            .with_pr(ctx.pr.as_ref())
             .arg("-V")
             .envs(self.exec_env(&ctx.config, ts, tv).await?)
             .prepend_path(self.list_bin_paths(&ctx.config, tv).await?)?
@@ -73,28 +77,55 @@ impl Backend for RustPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
-        let versions = github::list_releases("rust-lang/rust")
+    /// Rust uses rustup for installation, which handles its own downloads.
+    /// Lockfile URLs are not applicable since we don't download artifacts directly.
+    fn supports_lockfile_url(&self) -> bool {
+        false
+    }
+
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+        let versions: Vec<VersionInfo> = github::list_releases("rust-lang/rust")
             .await?
             .into_iter()
-            .map(|r| r.tag_name)
+            .map(|r| VersionInfo {
+                release_url: Some(format!("https://releases.rs/docs/{}/", r.tag_name)),
+                version: r.tag_name,
+                created_at: Some(r.created_at),
+                ..Default::default()
+            })
             .rev()
-            .chain(vec!["nightly".into(), "beta".into(), "stable".into()])
+            .chain(vec![
+                // Special channels - these are rolling releases that should always be updated
+                VersionInfo {
+                    version: "nightly".into(),
+                    rolling: true,
+                    ..Default::default()
+                },
+                VersionInfo {
+                    version: "beta".into(),
+                    rolling: true,
+                    ..Default::default()
+                },
+                VersionInfo {
+                    version: "stable".into(),
+                    rolling: true,
+                    ..Default::default()
+                },
+            ])
             .collect();
         Ok(versions)
     }
 
-    fn idiomatic_filenames(&self) -> Result<Vec<String>> {
-        if Settings::get().experimental {
-            Ok(vec!["rust-toolchain.toml".into()])
-        } else {
-            Ok(vec![])
-        }
+    async fn _idiomatic_filenames(&self) -> Result<Vec<String>> {
+        Ok(vec!["rust-toolchain.toml".into()])
     }
 
-    fn parse_idiomatic_file(&self, path: &Path) -> Result<String> {
+    async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
         let rt = parse_idiomatic_file(path)?;
-        Ok(rt.channel)
+        if rt.channel.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![rt.channel])
     }
 
     async fn install_version_(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion> {
@@ -103,18 +134,19 @@ impl Backend for RustPlugin {
 
         let (profile, components, targets) = get_args(&tv);
 
-        CmdLineRunner::new(RUSTUP_BIN)
-            .with_pr(&ctx.pr)
+        let mut cmd = CmdLineRunner::new(RUSTUP_BIN)
+            .with_pr(ctx.pr.as_ref())
             .arg("toolchain")
             .arg("install")
             .arg(&tv.version)
-            .opt_arg(profile.as_ref().map(|_| "--profile"))
-            .opt_arg(profile)
             .opt_args("--component", components)
             .opt_args("--target", targets)
             .prepend_path(self.list_bin_paths(&ctx.config, &tv).await?)?
-            .envs(self.exec_env(&ctx.config, ts, &tv).await?)
-            .execute()?;
+            .envs(self.exec_env(&ctx.config, ts, &tv).await?);
+        if let Some(profile) = profile.as_ref() {
+            cmd = cmd.arg("--profile").arg(profile);
+        }
+        cmd.execute()?;
 
         file::remove_all(tv.install_path())?;
         file::make_symlink(&cargo_home().join("bin"), &tv.install_path())?;
@@ -127,7 +159,7 @@ impl Backend for RustPlugin {
     async fn uninstall_version_impl(
         &self,
         config: &Arc<Config>,
-        pr: &Box<dyn SingleReport>,
+        pr: &dyn SingleReport,
         tv: &ToolVersion,
     ) -> Result<()> {
         let ts = config.get_toolset().await?;
@@ -177,10 +209,11 @@ impl Backend for RustPlugin {
         config: &Arc<Config>,
         tv: &ToolVersion,
         bump: bool,
+        opts: &ResolveOptions,
     ) -> Result<Option<OutdatedInfo>> {
         let v_re = regex!(r#"Update available : (.*) -> (.*)"#);
         if regex!(r"(\d+)\.(\d+)\.(\d+)").is_match(&tv.version) {
-            let oi = OutdatedInfo::resolve(config, tv.clone(), bump).await?;
+            let oi = OutdatedInfo::resolve(config, tv.clone(), bump, opts).await?;
             Ok(oi)
         } else {
             let ts = config.get_toolset().await?;
@@ -191,13 +224,13 @@ impl Backend for RustPlugin {
             }
             let out = cmd.read()?;
             for line in out.lines() {
-                if line.starts_with(&self.target_triple(tv)) {
-                    if let Some(_cap) = v_re.captures(line) {
-                        // let requested = cap.get(1).unwrap().as_str().to_string();
-                        // let latest = cap.get(2).unwrap().as_str().to_string();
-                        let oi = OutdatedInfo::new(config, tv.clone(), tv.version.clone())?;
-                        return Ok(Some(oi));
-                    }
+                if line.starts_with(&self.target_triple(tv))
+                    && let Some(_cap) = v_re.captures(line)
+                {
+                    // let requested = cap.get(1).unwrap().as_str().to_string();
+                    // let latest = cap.get(2).unwrap().as_str().to_string();
+                    let oi = OutdatedInfo::new(config, tv.clone(), tv.version.clone())?;
+                    return Ok(Some(oi));
                 }
             }
             Ok(None)
@@ -232,7 +265,7 @@ fn get_args(tv: &ToolVersion) -> (Option<String>, Option<Vec<String>>, Option<Ve
     let profile = rt
         .as_ref()
         .and_then(|rt| rt.profile.clone())
-        .or_else(|| tv.request.options().get("profile").cloned());
+        .or_else(|| tv.request.options().get("profile").map(|s| s.to_string()));
     let components = rt
         .as_ref()
         .and_then(|rt| rt.components.clone())
@@ -246,8 +279,8 @@ fn get_args(tv: &ToolVersion) -> (Option<String>, Option<Vec<String>>, Option<Ve
 }
 
 fn parse_idiomatic_file(path: &Path) -> Result<RustToolchain> {
-    let toml = file::read_to_string(path)?;
-    let toml = toml.parse::<toml::Value>()?;
+    let content = file::read_to_string(path)?;
+    let toml: toml::Value = toml::de::from_str(&content)?;
     let mut rt = RustToolchain::default();
     if let Some(toolchain) = toml.get("toolchain") {
         if let Some(channel) = toolchain.get("channel") {

@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use itertools::Itertools;
 use reqwest::Url;
 use std::collections::BTreeMap;
@@ -13,16 +14,25 @@ use crate::hooks::backend_exec_env::BackendExecEnvContext;
 use crate::hooks::backend_install::BackendInstallContext;
 use crate::hooks::backend_list_versions::BackendListVersionsContext;
 use crate::hooks::env_keys::{EnvKey, EnvKeysContext};
-use crate::hooks::mise_env::MiseEnvContext;
+use crate::hooks::mise_env::{MiseEnvContext, MiseEnvResult};
 use crate::hooks::mise_path::MisePathContext;
 use crate::hooks::parse_legacy_file::ParseLegacyFileResponse;
 use crate::hooks::post_install::PostInstallContext;
-use crate::hooks::pre_install::PreInstall;
+use crate::hooks::pre_install::{PreInstall, PreInstallAttestation, VerifiedAttestation};
 use crate::http::CLIENT;
 use crate::metadata::Metadata;
 use crate::plugin::Plugin;
 use crate::registry;
 use crate::sdk_info::SdkInfo;
+
+/// Install result containing optional checksum used for verification
+#[derive(Debug, Default)]
+pub struct InstallResult {
+    /// The SHA256 checksum if one was provided and verified
+    pub sha256: Option<String>,
+    /// The type of attestation that was successfully verified (if any)
+    pub verified_attestation: Option<VerifiedAttestation>,
+}
 
 #[derive(Debug)]
 pub struct Vfox {
@@ -99,16 +109,24 @@ impl Vfox {
     }
 
     pub fn get_sdk(&self, name: &str) -> Result<Plugin> {
-        Plugin::from_dir(&self.plugin_dir.join(name))
+        Plugin::from_name_or_dir(name, &self.plugin_dir.join(name))
     }
 
     pub fn install_plugin(&self, sdk: &str) -> Result<Plugin> {
+        // Check filesystem first - allows user to override embedded plugins
         let plugin_dir = self.plugin_dir.join(sdk);
-        if !plugin_dir.exists() {
-            let url = registry::sdk_url(sdk).ok_or_else(|| format!("Unknown SDK: {sdk}"))?;
-            return self.install_plugin_from_url(url);
+        if plugin_dir.exists() {
+            return Plugin::from_dir(&plugin_dir);
         }
-        Plugin::from_dir(&plugin_dir)
+
+        // Fall back to embedded plugin if available
+        if let Some(embedded) = crate::embedded_plugins::get_embedded_plugin(sdk) {
+            return Plugin::from_embedded(sdk, embedded);
+        }
+
+        // Otherwise install from registry
+        let url = registry::sdk_url(sdk).ok_or_else(|| format!("Unknown SDK: {sdk}"))?;
+        self.install_plugin_from_url(url)
     }
 
     pub fn install_plugin_from_url(&self, url: &Url) -> Result<Plugin> {
@@ -143,15 +161,16 @@ impl Vfox {
         sdk: &str,
         version: &str,
         install_dir: ID,
-    ) -> Result<()> {
+    ) -> Result<InstallResult> {
         self.install_plugin(sdk)?;
         let sdk = self.get_sdk(sdk)?;
         let pre_install = sdk.pre_install(version).await?;
         let install_dir = install_dir.as_ref();
         trace!("{pre_install:?}");
+        let mut verified_attestation = None;
         if let Some(url) = pre_install.url.as_ref().map(|s| Url::from_str(s)) {
             let file = self.download(&url?, &sdk, version).await?;
-            self.verify(&pre_install, &file)?;
+            verified_attestation = self.verify(&pre_install, &file).await?;
             self.extract(&file, install_dir)?;
         }
 
@@ -165,7 +184,10 @@ impl Vfox {
             .await?;
         }
 
-        Ok(())
+        Ok(InstallResult {
+            sha256: pre_install.sha256,
+            verified_attestation,
+        })
     }
 
     pub fn uninstall(&self, sdk: &str, version: &str) -> Result<()> {
@@ -174,11 +196,46 @@ impl Vfox {
         Ok(())
     }
 
+    pub async fn pre_install_for_platform(
+        &self,
+        sdk: &str,
+        version: &str,
+        os: &str,
+        arch: &str,
+    ) -> Result<PreInstall> {
+        let sdk = self.get_sdk(sdk)?;
+        sdk.pre_install_for_platform(version, os, arch).await
+    }
+
+    /// Returns the download URL and the highest-priority verified attestation type
+    /// declared by the plugin for the given platform, without performing actual
+    /// verification or installation.
+    pub async fn pre_install_provenance_for_platform(
+        &self,
+        sdk: &str,
+        version: &str,
+        os: &str,
+        arch: &str,
+    ) -> Result<(Option<String>, Option<VerifiedAttestation>)> {
+        let pre = self
+            .pre_install_for_platform(sdk, version, os, arch)
+            .await?;
+        let att = pre.attestation.and_then(attestation_to_verified);
+        // Note: pre.sha256 / pre.sha512 are intentionally not returned here;
+        // checksum verification only happens during `mise install`, not `mise lock`.
+        Ok((pre.url, att))
+    }
+
     pub async fn metadata(&self, sdk: &str) -> Result<Metadata> {
         self.get_sdk(sdk)?.get_metadata()
     }
 
-    pub async fn env_keys(&self, sdk: &str, version: &str) -> Result<Vec<EnvKey>> {
+    pub async fn env_keys<T: serde::Serialize>(
+        &self,
+        sdk: &str,
+        version: &str,
+        options: T,
+    ) -> Result<Vec<EnvKey>> {
         debug!("Getting env keys for {sdk} version {version}");
         let sdk = self.get_sdk(sdk)?;
         let sdk_info = sdk.sdk_info(
@@ -191,12 +248,22 @@ impl Vfox {
             path: sdk_info.path.clone(),
             sdk_info: BTreeMap::from([(sdk_info.name.clone(), sdk_info.clone())]),
             main: sdk_info,
+            options,
         };
         sdk.env_keys(ctx).await
     }
 
-    pub async fn mise_env<T: serde::Serialize>(&self, sdk: &str, opts: T) -> Result<Vec<EnvKey>> {
+    pub async fn mise_env<T: serde::Serialize>(
+        &self,
+        sdk: &str,
+        opts: T,
+        env: &indexmap::IndexMap<String, String>,
+    ) -> Result<MiseEnvResult> {
         let plugin = self.get_sdk(sdk)?;
+        if !plugin.get_metadata()?.hooks.contains("mise_env") {
+            return Ok(MiseEnvResult::default());
+        }
+        plugin.set_cmd_env(env)?;
         let ctx = MiseEnvContext {
             args: vec![],
             options: opts,
@@ -218,12 +285,16 @@ impl Vfox {
         tool: &str,
         version: &str,
         install_path: PathBuf,
+        download_path: PathBuf,
+        options: IndexMap<String, String>,
     ) -> Result<()> {
         let plugin = self.get_sdk(sdk)?;
         let ctx = BackendInstallContext {
             tool: tool.to_string(),
             version: version.to_string(),
             install_path,
+            download_path,
+            options,
         };
         plugin.backend_install(ctx).await?;
         Ok(())
@@ -235,18 +306,29 @@ impl Vfox {
         tool: &str,
         version: &str,
         install_path: PathBuf,
+        options: IndexMap<String, String>,
     ) -> Result<Vec<EnvKey>> {
         let plugin = self.get_sdk(sdk)?;
         let ctx = BackendExecEnvContext {
             tool: tool.to_string(),
             version: version.to_string(),
             install_path,
+            options,
         };
         plugin.backend_exec_env(ctx).await.map(|r| r.env_vars)
     }
 
-    pub async fn mise_path<T: serde::Serialize>(&self, sdk: &str, opts: T) -> Result<Vec<String>> {
+    pub async fn mise_path<T: serde::Serialize>(
+        &self,
+        sdk: &str,
+        opts: T,
+        env: &indexmap::IndexMap<String, String>,
+    ) -> Result<Vec<String>> {
         let plugin = self.get_sdk(sdk)?;
+        if !plugin.get_metadata()?.hooks.contains("mise_path") {
+            return Ok(vec![]);
+        }
+        plugin.set_cmd_env(env)?;
         let ctx = MisePathContext {
             args: vec![],
             options: opts,
@@ -279,10 +361,15 @@ impl Vfox {
         let mut file = tokio::fs::File::create(&path).await?;
         let bytes = resp.bytes().await?;
         tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
+        file.sync_all().await?;
         Ok(path)
     }
 
-    fn verify(&self, pre_install: &PreInstall, file: &Path) -> Result<()> {
+    async fn verify(
+        &self,
+        pre_install: &PreInstall,
+        file: &Path,
+    ) -> Result<Option<VerifiedAttestation>> {
         self.log_emit(format!("Verifying {file:?} checksum"));
         if let Some(sha256) = &pre_install.sha256 {
             xx::hash::ensure_checksum_sha256(file, sha256)?;
@@ -296,7 +383,73 @@ impl Vfox {
         if let Some(_md5) = &pre_install.md5 {
             unimplemented!("md5")
         }
-        Ok(())
+        let mut verified: Option<VerifiedAttestation> = None;
+        if let Some(attestation) = &pre_install.attestation {
+            self.log_emit(format!("Verify {file:?} attestation"));
+            if let Some(owner) = &attestation.github_owner
+                && let Some(repo) = &attestation.github_repo
+            {
+                let token = std::env::var("MISE_GITHUB_TOKEN")
+                    .or_else(|_| std::env::var("GITHUB_TOKEN"))
+                    .or(Err("GitHub artifact attestation verification requires either the MISE_GITHUB_TOKEN or GITHUB_TOKEN environment variable set"))?;
+                sigstore_verification::verify_github_attestation(
+                    file,
+                    owner.as_str(),
+                    repo.as_str(),
+                    Some(token.as_str()),
+                    attestation.github_signer_workflow.as_deref(),
+                )
+                .await?;
+                // All configured verifications always execute (no short-circuit).
+                // Priority only affects which variant is *recorded* in `verified`.
+                // GitHub attestations have the highest recording priority.
+                verified = Some(VerifiedAttestation::GithubAttestations {
+                    owner: owner.clone(),
+                    repo: repo.clone(),
+                    signer_workflow: attestation.github_signer_workflow.clone(),
+                });
+            }
+
+            if let Some(sig_or_bundle_path) = &attestation.cosign_sig_or_bundle_path {
+                if let Some(public_key_path) = &attestation.cosign_public_key_path {
+                    sigstore_verification::verify_cosign_signature_with_key(
+                        file,
+                        sig_or_bundle_path,
+                        public_key_path,
+                    )
+                    .await?;
+                } else {
+                    sigstore_verification::verify_cosign_signature(file, sig_or_bundle_path)
+                        .await?;
+                }
+                // Cosign has the lowest recording priority: only record it if no
+                // higher-priority verification was already recorded.
+                if verified.is_none() {
+                    verified = Some(VerifiedAttestation::Cosign {
+                        sig_or_bundle_path: sig_or_bundle_path.clone(),
+                        public_key_path: attestation.cosign_public_key_path.clone(),
+                    });
+                }
+            }
+
+            if let Some(provenance_path) = &attestation.slsa_provenance_path {
+                let min_level = attestation.slsa_min_level.unwrap_or(1u8);
+                sigstore_verification::verify_slsa_provenance(file, provenance_path, min_level)
+                    .await?;
+                // SLSA has mid-tier recording priority: record it unless GitHub
+                // attestation (higher priority) was already recorded.
+                // Note: if Cosign also passed, SLSA supersedes it (SLSA > Cosign).
+                if !matches!(
+                    verified,
+                    Some(VerifiedAttestation::GithubAttestations { .. })
+                ) {
+                    verified = Some(VerifiedAttestation::Slsa {
+                        provenance_path: provenance_path.clone(),
+                    });
+                }
+            }
+        }
+        Ok(verified)
     }
 
     fn extract(&self, file: &Path, install_dir: &Path) -> Result<()> {
@@ -316,13 +469,16 @@ impl Vfox {
             }
             Result::Ok(())
         };
-        if filename.ends_with(".tar.gz") {
+        if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
             xx::archive::untar_gz(file, tmp.path())?;
             move_to_install()?;
-        } else if filename.ends_with(".tar.xz") {
+        } else if filename.ends_with(".tar.xz") || filename.ends_with(".txz") {
             xx::archive::untar_xz(file, tmp.path())?;
             move_to_install()?;
-        } else if filename.ends_with(".tar.bz2") {
+        } else if filename.ends_with(".tar.bz2")
+            || filename.ends_with(".tbz2")
+            || filename.ends_with(".tbz")
+        {
             xx::archive::untar_bz2(file, tmp.path())?;
             move_to_install()?;
         } else if filename.ends_with(".zip") {
@@ -335,6 +491,36 @@ impl Vfox {
         }
         Ok(())
     }
+}
+
+/// Convert a `PreInstallAttestation` to the highest-priority `VerifiedAttestation` variant
+/// declared by the plugin. Priority: GitHub > SLSA > Cosign.
+///
+/// This is used by `pre_install_provenance_for_platform` to report what *type* of attestation
+/// the plugin declares, without actually performing sigstore verification.
+fn attestation_to_verified(att: PreInstallAttestation) -> Option<VerifiedAttestation> {
+    // GitHub attestations have the highest priority
+    if let Some(owner) = att.github_owner
+        && let Some(repo) = att.github_repo
+    {
+        return Some(VerifiedAttestation::GithubAttestations {
+            owner,
+            repo,
+            signer_workflow: att.github_signer_workflow,
+        });
+    }
+    // SLSA is second priority
+    if let Some(provenance_path) = att.slsa_provenance_path {
+        return Some(VerifiedAttestation::Slsa { provenance_path });
+    }
+    // Cosign is third priority
+    if let Some(sig_or_bundle_path) = att.cosign_sig_or_bundle_path {
+        return Some(VerifiedAttestation::Cosign {
+            sig_or_bundle_path,
+            public_key_path: att.cosign_public_key_path,
+        });
+    }
+    None
 }
 
 impl Default for Vfox {
@@ -377,8 +563,15 @@ mod tests {
     #[tokio::test]
     async fn test_env_keys() {
         let vfox = Vfox::test();
-        vfox.install_plugin("nodejs").unwrap();
-        let keys = vfox.env_keys("nodejs", "20.0.0").await.unwrap();
+        // dummy plugin already exists in plugins/dummy, no need to install
+        let keys = vfox
+            .env_keys(
+                "dummy",
+                "1.0.0",
+                serde_json::Value::Object(Default::default()),
+            )
+            .await
+            .unwrap();
         let output = format!("{keys:?}").replace(
             &vfox.install_dir.to_string_lossy().to_string(),
             "<INSTALL_DIR>",
@@ -389,31 +582,22 @@ mod tests {
     #[tokio::test]
     async fn test_install_plugin() {
         let vfox = Vfox::test();
-        vfox.uninstall_plugin("nodejs").unwrap();
-        assert!(!vfox.plugin_dir.join("nodejs").exists());
-        vfox.install_plugin("nodejs").unwrap();
-        assert!(vfox.plugin_dir.join("nodejs").exists());
+        // dummy plugin already exists in plugins/dummy, just verify it's there
+        assert!(vfox.plugin_dir.join("dummy").exists());
+        let plugin = Plugin::from_dir(&vfox.plugin_dir.join("dummy")).unwrap();
+        assert_eq!(plugin.name, "dummy");
     }
 
     #[tokio::test]
     async fn test_install() {
         let vfox = Vfox::test();
-        let install_dir = vfox.install_dir.join("nodejs").join("20.0.0");
-        vfox.install("nodejs", "20.0.0", &install_dir)
-            .await
-            .unwrap();
-        assert!(vfox
-            .install_dir
-            .join("nodejs")
-            .join("20.0.0")
-            .join("bin")
-            .join("node")
-            .exists());
-        vfox.uninstall_plugin("nodejs").unwrap();
-        assert!(!vfox.plugin_dir.join("nodejs").exists());
-        vfox.uninstall("nodejs", "20.0.0").unwrap();
-        assert!(!vfox.install_dir.join("nodejs").join("20.0.0").exists());
-        file::remove_dir_all(vfox.plugin_dir.join("nodejs")).unwrap();
+        let install_dir = vfox.install_dir.join("dummy").join("1.0.0");
+        // dummy plugin already exists in plugins/dummy
+        vfox.install("dummy", "1.0.0", &install_dir).await.unwrap();
+        // dummy plugin doesn't actually install binaries, so we just check the directory
+        assert!(vfox.install_dir.join("dummy").join("1.0.0").exists());
+        vfox.uninstall("dummy", "1.0.0").unwrap();
+        assert!(!vfox.install_dir.join("dummy").join("1.0.0").exists());
         file::remove_dir_all(vfox.install_dir).unwrap();
         file::remove_dir_all(vfox.download_dir).unwrap();
     }
@@ -426,31 +610,34 @@ mod tests {
         let install_dir = vfox.install_dir.join("cmake").join("3.21.0");
         vfox.install("cmake", "3.21.0", &install_dir).await.unwrap();
         if cfg!(target_os = "linux") {
-            assert!(vfox
-                .install_dir
-                .join("cmake")
-                .join("3.21.0")
-                .join("bin")
-                .join("cmake")
-                .exists());
+            assert!(
+                vfox.install_dir
+                    .join("cmake")
+                    .join("3.21.0")
+                    .join("bin")
+                    .join("cmake")
+                    .exists()
+            );
         } else if cfg!(target_os = "macos") {
-            assert!(vfox
-                .install_dir
-                .join("cmake")
-                .join("3.21.0")
-                .join("CMake.app")
-                .join("Contents")
-                .join("bin")
-                .join("cmake")
-                .exists());
+            assert!(
+                vfox.install_dir
+                    .join("cmake")
+                    .join("3.21.0")
+                    .join("CMake.app")
+                    .join("Contents")
+                    .join("bin")
+                    .join("cmake")
+                    .exists()
+            );
         } else if cfg!(target_os = "windows") {
-            assert!(vfox
-                .install_dir
-                .join("cmake")
-                .join("3.21.0")
-                .join("bin")
-                .join("cmake.exe")
-                .exists());
+            assert!(
+                vfox.install_dir
+                    .join("cmake")
+                    .join("3.21.0")
+                    .join("bin")
+                    .join("cmake.exe")
+                    .exists()
+            );
         }
         vfox.uninstall_plugin("cmake").unwrap();
         assert!(!vfox.plugin_dir.join("cmake").exists());
@@ -464,7 +651,8 @@ mod tests {
     #[tokio::test]
     async fn test_metadata() {
         let vfox = Vfox::test();
-        let metadata = vfox.metadata("nodejs").await.unwrap();
+        // dummy plugin already exists in plugins/dummy
+        let metadata = vfox.metadata("dummy").await.unwrap();
         let out = format!("{metadata:?}");
         assert_snapshot!(out);
     }

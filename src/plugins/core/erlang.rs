@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
 use std::{path::PathBuf, sync::Arc};
 
 use crate::backend::Backend;
+use crate::backend::VersionInfo;
+use crate::backend::platform_target::PlatformTarget;
 use crate::cli::args::BackendArg;
 use crate::config::{Config, Settings};
 #[cfg(unix)]
@@ -10,7 +13,7 @@ use crate::http::{HTTP, HTTP_FETCH};
 use crate::install_context::InstallContext;
 use crate::lock_file::LockFile;
 use crate::toolset::{ToolRequest, ToolVersion};
-use crate::{cmd, file, github, plugins};
+use crate::{file, github, plugins};
 use async_trait::async_trait;
 use eyre::Result;
 use xx::regex;
@@ -25,7 +28,7 @@ pub struct ErlangPlugin {
     ba: Arc<BackendArg>,
 }
 
-const KERL_VERSION: &str = "4.1.1";
+const KERL_VERSION: &str = "4.4.0";
 
 impl ErlangPlugin {
     pub fn new() -> Self {
@@ -58,9 +61,13 @@ impl ErlangPlugin {
             return Ok(());
         }
         self.install_kerl().await?;
-        cmd!(self.kerl_path(), "update", "releases")
+        let output = cmd!(self.kerl_path(), "update", "releases")
             .env("KERL_BASE_DIR", self.kerl_base_dir())
+            .stdout_capture()
+            .stderr_capture()
             .run()?;
+        trace!("kerl stdout: {}", String::from_utf8_lossy(&output.stdout));
+        trace!("kerl stderr: {}", String::from_utf8_lossy(&output.stderr));
         Ok(())
     }
 
@@ -88,11 +95,12 @@ impl ErlangPlugin {
         }
         let release_tag = format!("OTP-{}", tv.version);
 
-        let arch: String = match ARCH {
-            "x86_64" => "amd64".to_string(),
-            "aarch64" => "arm64".to_string(),
-            _ => {
-                debug!("Unsupported architecture: {}", ARCH);
+        let settings = Settings::get();
+        let arch: String = match settings.arch() {
+            "x64" => "amd64".to_string(),
+            "arm64" => "arm64".to_string(),
+            other => {
+                debug!("Unsupported architecture: {}", other);
                 return Ok(None);
             }
         };
@@ -125,7 +133,7 @@ impl ErlangPlugin {
 
         ctx.pr.set_message(format!("Downloading {filename}"));
         if !tarball_path.exists() {
-            HTTP.download_file(&url, &tarball_path, Some(&ctx.pr))
+            HTTP.download_file(&url, &tarball_path, Some(ctx.pr.as_ref()))
                 .await?;
         }
         ctx.pr.set_message(format!("Extracting {filename}"));
@@ -133,16 +141,15 @@ impl ErlangPlugin {
             &tarball_path,
             &tv.download_path(),
             &TarOptions {
-                strip_components: 0,
-                pr: Some(&ctx.pr),
-                format: file::TarFormat::TarGz,
+                pr: Some(ctx.pr.as_ref()),
+                ..TarOptions::new(file::TarFormat::TarGz)
             },
         )?;
 
         self.move_to_install_path(&tv)?;
 
         CmdLineRunner::new(tv.install_path().join("Install"))
-            .with_pr(&ctx.pr)
+            .with_pr(ctx.pr.as_ref())
             .arg("-minimal")
             .arg(tv.install_path())
             .execute()?;
@@ -187,7 +194,17 @@ impl ErlangPlugin {
                 return Ok(None);
             }
         };
-        let tarball_name = format!("otp-{ARCH}-{OS}.tar.gz");
+        let settings = Settings::get();
+        let arch = match settings.arch() {
+            "x64" => "x86_64",
+            "arm64" => "aarch64",
+            other => other,
+        };
+        let os = match settings.os() {
+            "macos" => "apple-darwin",
+            other => other,
+        };
+        let tarball_name = format!("otp-{arch}-{os}.tar.gz");
         let asset = match gh_release.assets.iter().find(|a| a.name == tarball_name) {
             Some(asset) => asset,
             None => {
@@ -197,17 +214,20 @@ impl ErlangPlugin {
         };
         ctx.pr.set_message(format!("Downloading {tarball_name}"));
         let tarball_path = tv.download_path().join(&tarball_name);
-        HTTP.download_file(&asset.browser_download_url, &tarball_path, Some(&ctx.pr))
-            .await?;
+        HTTP.download_file(
+            &asset.browser_download_url,
+            &tarball_path,
+            Some(ctx.pr.as_ref()),
+        )
+        .await?;
         self.verify_checksum(ctx, &mut tv, &tarball_path)?;
         ctx.pr.set_message(format!("Extracting {tarball_name}"));
         file::untar(
             &tarball_path,
             &tv.install_path(),
             &TarOptions {
-                strip_components: 0,
-                pr: Some(&ctx.pr),
-                format: file::TarFormat::TarGz,
+                pr: Some(ctx.pr.as_ref()),
+                ..TarOptions::new(file::TarFormat::TarGz)
             },
         )?;
         Ok(Some(tv))
@@ -230,7 +250,12 @@ impl ErlangPlugin {
                 return Ok(None);
             }
         };
-        let zip_name = format!("otp_{OS}_{version}.zip", version = tv.version);
+        let settings = Settings::get();
+        let os = match settings.os() {
+            "windows" => "win64",
+            other => other,
+        };
+        let zip_name = format!("otp_{os}_{version}.zip", version = tv.version);
         let asset = match gh_release.assets.iter().find(|a| a.name == zip_name) {
             Some(asset) => asset,
             None => {
@@ -240,8 +265,12 @@ impl ErlangPlugin {
         };
         ctx.pr.set_message(format!("Downloading {}", zip_name));
         let zip_path = tv.download_path().join(&zip_name);
-        HTTP.download_file(&asset.browser_download_url, &zip_path, Some(&ctx.pr))
-            .await?;
+        HTTP.download_file(
+            &asset.browser_download_url,
+            &zip_path,
+            Some(ctx.pr.as_ref()),
+        )
+        .await?;
         self.verify_checksum(ctx, &mut tv, &zip_path)?;
         ctx.pr.set_message(format!("Extracting {}", zip_name));
         file::unzip(&zip_path, &tv.install_path(), &Default::default())?;
@@ -293,26 +322,44 @@ impl Backend for ErlangPlugin {
         &self.ba
     }
 
-    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<String>> {
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
         let versions = if Settings::get().erlang.compile == Some(false) {
             github::list_releases("erlef/otp_builds")
                 .await?
                 .into_iter()
-                .filter_map(|r| r.tag_name.strip_prefix("OTP-").map(|s| s.to_string()))
+                .filter_map(|r| {
+                    r.tag_name
+                        .strip_prefix("OTP-")
+                        .map(|s| (s.to_string(), Some(r.created_at)))
+                })
+                .map(|(version, created_at)| VersionInfo {
+                    version,
+                    created_at,
+                    ..Default::default()
+                })
                 .collect()
         } else {
             self.update_kerl().await?;
-            plugins::core::run_fetch_task_with_timeout(move || {
-                let output = cmd!(self.kerl_path(), "list", "releases", "all")
-                    .env("KERL_BASE_DIR", self.ba.cache_path.join("kerl"))
-                    .read()?;
+            let kerl_path = self.kerl_path().to_string_lossy().to_string();
+            let kerl_base_dir = self.ba.cache_path.join("kerl");
+            plugins::core::run_fetch_task_with_timeout_async(async move || {
+                let output = crate::cmd::cmd_read_async_inherited_env(
+                    &kerl_path,
+                    &["list", "releases", "all"],
+                    [("KERL_BASE_DIR", kerl_base_dir.as_os_str())],
+                )
+                .await?;
                 let versions = output
                     .split('\n')
                     .filter(|s| regex!(r"^[0-9].+$").is_match(s))
-                    .map(|s| s.to_string())
+                    .map(|s| VersionInfo {
+                        version: s.to_string(),
+                        ..Default::default()
+                    })
                     .collect();
                 Ok(versions)
-            })?
+            })
+            .await?
         };
         Ok(versions)
     }
@@ -323,19 +370,26 @@ impl Backend for ErlangPlugin {
         }
         self.install_via_kerl(ctx, tv).await
     }
+
+    fn resolve_lockfile_options(
+        &self,
+        _request: &ToolRequest,
+        target: &PlatformTarget,
+    ) -> BTreeMap<String, String> {
+        let mut opts = BTreeMap::new();
+        let settings = Settings::get();
+        let is_current_platform = target.is_current();
+
+        // Only include compile option if true (non-default)
+        let compile = if is_current_platform {
+            settings.erlang.compile.unwrap_or(false)
+        } else {
+            false
+        };
+        if compile {
+            opts.insert("compile".to_string(), "true".to_string());
+        }
+
+        opts
+    }
 }
-
-#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
-pub const ARCH: &str = "x86_64";
-
-#[cfg(all(target_arch = "aarch64", not(target_os = "windows")))]
-const ARCH: &str = "aarch64";
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const ARCH: &str = "unknown";
-
-#[cfg(windows)]
-const OS: &str = "win64";
-
-#[cfg(macos)]
-const OS: &str = "apple-darwin";
